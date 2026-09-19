@@ -61,15 +61,17 @@ type pendingTracks struct {
 }
 
 type SpotifyProvider struct {
-	session    *Session
-	clientID   string
-	bitrate    int
-	userID     string // Spotify user ID, fetched lazily on first Playlists() call
-	meFetched  bool   // /v1/me has been attempted this session; suppresses retry on failure
-	mu         sync.Mutex
-	trackCache map[string]*playlistCache // playlist ID → cache entry
-	pending    map[string]*pendingTracks
-	authCancel context.CancelFunc // cancels any in-progress OAuth flow
+	session         *Session
+	clientID        string
+	bitrate         int
+	userID          string // Spotify user ID, fetched lazily on first Playlists() call
+	meFetched       bool   // /v1/me has been attempted this session; suppresses retry on failure
+	mu              sync.Mutex
+	trackCache      map[string]*playlistCache // playlist ID → cache entry
+	pending         map[string]*pendingTracks
+	rootlistEntries []rootlistEntry     // ordered library incl. folders, from spclient
+	contextURIs     map[string][]string // playlist ID -> ordered track URIs, from spclient
+	authCancel      context.CancelFunc  // cancels any in-progress OAuth flow
 
 	// Playlist list cache to avoid redundant API calls on provider switch.
 	listCache   []playlist.PlaylistInfo
@@ -83,11 +85,12 @@ const playlistListCacheTTL = 5 * time.Minute
 // bitrate sets the preferred Spotify stream quality in kbps (96, 160, or 320).
 func New(session *Session, clientID string, bitrate int) *SpotifyProvider {
 	return &SpotifyProvider{
-		session:    session,
-		clientID:   clientID,
-		bitrate:    bitrate,
-		trackCache: make(map[string]*playlistCache),
-		pending:    make(map[string]*pendingTracks),
+		session:     session,
+		clientID:    clientID,
+		bitrate:     bitrate,
+		trackCache:  make(map[string]*playlistCache),
+		pending:     make(map[string]*pendingTracks),
+		contextURIs: make(map[string][]string),
 	}
 }
 
@@ -224,36 +227,32 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
+	// Spotify's own client protocol returns the whole library in one request,
+	// including folders and the entries the Web API declines to list. Fall back
+	// to the Web API when it is unavailable: it is an internal endpoint, so a
+	// working listing matters more than the richer one.
+	if lists, err := p.playlistsFromRootlist(ctx); err == nil {
+		p.mu.Lock()
+		p.listCache = lists
+		p.listCacheAt = time.Now()
+		p.mu.Unlock()
+		return slices.Clone(lists), nil
+	} else {
+		applog.Warn("spotify: rootlist unavailable, falling back to the web api: %v", err)
+	}
+
 	userID := p.currentUserID(ctx)
 
 	var all []playlist.PlaylistInfo
 	offset := 0
 	limit := spotifyPlaylistPageSize
 
-	// List of Playlists only includes created playlists by the User.
-	// This doesn't include the 'Liked Songs' playlist.
-	resp, err := p.webAPI(ctx, "GET", "/v1/me/tracks", nil)
+	// Liked Songs is not part of /v1/me/playlists, so it is built separately.
+	liked, err := p.savedTracksInfo(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("spotify: your music: %w", err)
+		return nil, err
 	}
-
-	var result struct {
-		Total int `json:"total"`
-	}
-	if err := decodeBody(resp, &result); err != nil {
-		return nil, fmt.Errorf("spotify: parse playlists: %w", err)
-	}
-
-	// Unfortunately, the Spotify API doesn't expose the localized display name.
-	// i.e. 'Liked Songs' or 'Lieblingssongs' etc.
-	// For the moment, "Your Music" must sufficice without adding a localization
-	// map.
-	all = append(all, playlist.PlaylistInfo{
-		ID:         savedTracksPlaylistID,
-		Name:       "Your Music",
-		TrackCount: result.Total,
-		Section:    "Library",
-	})
+	all = append(all, liked)
 
 	for {
 		query := url.Values{
@@ -397,6 +396,29 @@ func (p *SpotifyProvider) savedAlbums(ctx context.Context) ([]playlist.PlaylistI
 	return all, nil
 }
 
+// savedTracksInfo builds the Liked Songs row. Spotify does not list it among
+// the playlists and does not expose a localized display name for it, so the
+// name is fixed and only the count is fetched -- with limit=1, since the
+// response body is discarded apart from the total.
+func (p *SpotifyProvider) savedTracksInfo(ctx context.Context) (playlist.PlaylistInfo, error) {
+	resp, err := p.webAPI(ctx, "GET", "/v1/me/tracks", url.Values{"limit": {"1"}})
+	if err != nil {
+		return playlist.PlaylistInfo{}, fmt.Errorf("spotify: your music: %w", err)
+	}
+	var result struct {
+		Total int `json:"total"`
+	}
+	if err := decodeBody(resp, &result); err != nil {
+		return playlist.PlaylistInfo{}, fmt.Errorf("spotify: parse your music: %w", err)
+	}
+	return playlist.PlaylistInfo{
+		ID:         savedTracksPlaylistID,
+		Name:       "Your Music",
+		TrackCount: result.Total,
+		Section:    "Library",
+	}, nil
+}
+
 // Tracks returns all tracks for the given Spotify playlist ID.
 // Track.Path is set to the canonical spotify: URI for the player to resolve.
 // Results are cached by snapshot_id; unchanged playlists skip the API call.
@@ -466,6 +488,20 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 // returned slice is usually shorter than the page size and the caller must
 // advance by the page size rather than by len(tracks).
 func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, error) {
+	// Ordinary playlists go through Spotify's client protocol, which reads the
+	// ones the Web API refuses -- another user's list, a Spotify-owned mix --
+	// and is not subject to its quota. Saved tracks stay on the Web API: they
+	// are the user's own data, so it serves them, and there is no context URI
+	// for the collection. Fall back to the Web API if the client protocol is
+	// unavailable, since an older listing beats no tracks at all.
+	if playlistID != savedTracksPlaylistID {
+		tracks, total, err := p.contextTracksPage(ctx, playlistID, offset)
+		if err == nil {
+			return tracks, total, nil
+		}
+		applog.Warn("spotify: context resolve failed for %q, falling back to the web api: %v", playlistID, err)
+	}
+
 	query := url.Values{
 		"limit":  {strconv.Itoa(spotifyTrackPageSize)},
 		"offset": {strconv.Itoa(offset)},
