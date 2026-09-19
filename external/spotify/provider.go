@@ -294,6 +294,7 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 			if cached, ok := p.trackCache[item.ID]; ok {
 				if cached.snapshotID != item.SnapshotID {
 					delete(p.trackCache, item.ID)
+					delete(p.contextURIs, item.ID)
 				}
 			}
 			// Store snapshot_id for later cache checks in Tracks().
@@ -583,6 +584,17 @@ func (p *SpotifyProvider) playlistSnapshot(ctx context.Context, playlistID strin
 	return result.SnapshotID, nil
 }
 
+// discardLoadLocked drops everything scoped to one read of a playlist: the
+// partial accumulation, and the resolved track URIs behind it. The URI list is
+// a snapshot of the playlist taken when the read began, so it must not outlive
+// the read -- keeping it would serve an edited playlist from stale contents
+// that the snapshot pin cannot detect, since the length it compares comes from
+// the same stale list. p.mu must be held.
+func (p *SpotifyProvider) discardLoadLocked(playlistID string) {
+	delete(p.pending, playlistID)
+	delete(p.contextURIs, playlistID)
+}
+
 // cachedTracksLocked returns a copy of the committed list and its total, if
 // any. p.mu must be held.
 func (p *SpotifyProvider) cachedTracksLocked(playlistID string) (tracks []playlist.Track, total int, ok bool) {
@@ -714,14 +726,14 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 	// so the load can never commit -- stop now rather than spending the rest of
 	// the pages on a result that is already discarded.
 	if pend.total != total {
-		delete(p.pending, playlistID)
+		p.discardLoadLocked(playlistID)
 		return nil, 0, fmt.Errorf("spotify: list tracks %q: %w", playlistID, playlist.ErrListChanged)
 	}
 	pend.tracks = append(pend.tracks, page...)
 	pend.want = next
 	if next == 0 {
 		p.cacheTracksLocked(playlistID, pend.tracks, total)
-		delete(p.pending, playlistID)
+		p.discardLoadLocked(playlistID)
 	}
 	return page, next, nil
 }
@@ -1116,6 +1128,7 @@ func (p *SpotifyProvider) AddTrackToPlaylist(ctx context.Context, playlistID str
 	// Invalidate caches for this playlist.
 	p.mu.Lock()
 	delete(p.trackCache, playlistID)
+	delete(p.contextURIs, playlistID)
 	p.listCache = nil
 	p.mu.Unlock()
 

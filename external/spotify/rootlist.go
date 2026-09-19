@@ -21,7 +21,7 @@ import (
 // it, and they nest. The Web API has no concept of folders and omits entries it
 // will not serve, so the rootlist is both richer and cheaper -- one request for
 // the whole library rather than one per fifty playlists.
-const rootlistEnrichBudget = 10 * time.Second
+const rootlistEnrichBudget = 3 * time.Second
 
 const (
 	rootlistGroupStart = "spotify:start-group:"
@@ -138,9 +138,13 @@ func (p *SpotifyProvider) playlistsFromRootlist(ctx context.Context) ([]playlist
 
 	// Liked Songs and saved albums still come from the Web API, which can be
 	// throttled independently of the client protocol. Neither is worth losing
-	// the whole library over, so each gets a short deadline of its own and is
-	// skipped on failure rather than failing the listing.
-	if liked, err := p.savedTracksInfo(withBudget(ctx)); err == nil {
+	// the whole library over, so they share one short budget and are skipped on
+	// failure. Saved albums paginate, so budgeting them together bounds the
+	// delay regardless of how many requests that takes.
+	enrich, cancelEnrich := context.WithTimeout(ctx, rootlistEnrichBudget)
+	defer cancelEnrich()
+
+	if liked, err := p.savedTracksInfo(enrich); err == nil {
 		lists = append(lists, liked)
 	} else {
 		applog.Warn("spotify: liked songs count unavailable: %v", err)
@@ -153,7 +157,7 @@ func (p *SpotifyProvider) playlistsFromRootlist(ctx context.Context) ([]playlist
 
 	lists = append(lists, p.rootlistPlaylists(entries, p.session.sess.Username())...)
 
-	if albums, err := p.savedAlbums(withBudget(ctx)); err == nil {
+	if albums, err := p.savedAlbums(enrich); err == nil {
 		lists = append(lists, albums...)
 	} else {
 		applog.Warn("spotify: saved albums unavailable: %v", err)
@@ -163,16 +167,6 @@ func (p *SpotifyProvider) playlistsFromRootlist(ctx context.Context) ([]playlist
 	p.rememberRootlistLocked(entries)
 	p.mu.Unlock()
 	return lists, nil
-}
-
-// withBudget bounds an optional enrichment so a throttled Web API cannot spend
-// the caller's whole deadline on something the listing can do without.
-func withBudget(ctx context.Context) context.Context {
-	out, cancel := context.WithTimeout(ctx, rootlistEnrichBudget)
-	// The caller returns before the budget elapses in every path here; cancel
-	// on a timer so the context is not leaked if that ever stops being true.
-	time.AfterFunc(rootlistEnrichBudget, cancel)
-	return out
 }
 
 // rememberRootlistLocked keeps the ordered library, folders included, so a
