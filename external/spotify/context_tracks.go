@@ -139,21 +139,24 @@ func trackFromMetadata(uri string, tr *metadatapb.Track) playlist.Track {
 }
 
 // contextTracksPage serves one page of a playlist through the client protocol,
-// returning the page and the playlist's total length.
-func (p *SpotifyProvider) contextTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, error) {
+// returning the page, the playlist's total length, and the page size it used.
+// That size is not the Web API's: this path resolves the whole list up front
+// and then batches metadata, so a page is one metadata request rather than one
+// list request, and is sized to match.
+func (p *SpotifyProvider) contextTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, int, error) {
 	uris, err := p.contextTrackURIs(ctx, playlistID)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	if offset >= len(uris) {
-		return nil, len(uris), nil
+		return nil, len(uris), spotifyMetadataBatch, nil
 	}
-	end := min(offset+spotifyTrackPageSize, len(uris))
+	end := min(offset+spotifyMetadataBatch, len(uris))
 	tracks, err := p.trackMetadata(ctx, uris[offset:end])
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	return tracks, len(uris), nil
+	return tracks, len(uris), spotifyMetadataBatch, nil
 }
 
 // TrackRadio builds the station Spotify generates from a track -- what its own
@@ -192,11 +195,10 @@ func (p *SpotifyProvider) TrackRadio(ctx context.Context, trackPath string) (str
 	}
 
 	// Stations come back around fifty tracks long, which is one metadata batch.
-	// Resolve in page-sized chunks anyway so a longer one cannot build a single
-	// oversized request.
+	// Chunk anyway so a longer one cannot build a single oversized request.
 	tracks := make([]playlist.Track, 0, len(uris))
-	for start := 0; start < len(uris); start += spotifyTrackPageSize {
-		end := min(start+spotifyTrackPageSize, len(uris))
+	for start := 0; start < len(uris); start += spotifyMetadataBatch {
+		end := min(start+spotifyMetadataBatch, len(uris))
 		batch, err := p.trackMetadata(ctx, uris[start:end])
 		if err != nil {
 			return "", nil, err

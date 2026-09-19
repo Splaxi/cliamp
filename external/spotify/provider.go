@@ -461,7 +461,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 	var all []playlist.Track
 	total, offset, restarts := -1, 0, 0
 	for {
-		page, pageTotal, err := p.fetchTracksPage(ctx, playlistID, offset)
+		page, pageTotal, pageSize, err := p.fetchTracksPage(ctx, playlistID, offset)
 		if err != nil {
 			return nil, err
 		}
@@ -477,10 +477,10 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 			continue
 		}
 		all = append(all, page...)
-		if offset+spotifyTrackPageSize >= total {
+		if offset+pageSize >= total {
 			break
 		}
-		offset += spotifyTrackPageSize
+		offset += pageSize
 	}
 
 	// Cache the fetched tracks.
@@ -496,7 +496,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 // the user's own playlists there, so the common case stays on the documented
 // path; a playlist owned by someone else, or a Spotify-owned mix, comes back
 // 403 and is readable only through the client protocol.
-func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, error) {
+func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, int, error) {
 	fallback := p.apiMode.usesClient()
 
 	if fallback && p.apiMode.skipsWeb() {
@@ -515,20 +515,21 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 
 	tracks, total, err := p.webTracksPage(webCtx, playlistID, offset)
 	if err == nil {
-		return tracks, total, nil
+		// The Web API pages the list itself and caps a page at fifty.
+		return tracks, total, spotifyTrackPageSize, nil
 	}
 	if !fallback {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	applog.Warn("spotify: web api declined %q (%v), trying the client protocol", playlistID, err)
-	tracks, total, cerr := p.contextTracksPage(ctx, playlistID, offset)
+	tracks, total, size, cerr := p.contextTracksPage(ctx, playlistID, offset)
 	if cerr != nil {
 		// Report the Web API's refusal: it is the documented path and its error
 		// says why the playlist is unreadable.
 		applog.Warn("spotify: client protocol also failed for %q: %v", playlistID, cerr)
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
-	return tracks, total, nil
+	return tracks, total, size, nil
 }
 
 // webTracksPage reads one page of a playlist's tracks through the Web API and
@@ -703,12 +704,14 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 	if hit && (playlistID != savedTracksPlaylistID || p.savedTracksUnchanged(ctx, tracks, cachedTotal)) {
 		return tracks, 0, nil
 	}
-	page, total, err := p.fetchTracksPage(ctx, playlistID, offset)
+	page, total, pageSize, err := p.fetchTracksPage(ctx, playlistID, offset)
 	if err != nil {
 		return nil, 0, err
 	}
 
-	next := offset + spotifyTrackPageSize
+	// Page size follows whichever path served this page: the Web API pages the
+	// list and caps at fifty, the client protocol batches metadata instead.
+	next := offset + pageSize
 	if next >= total {
 		next = 0
 	}
