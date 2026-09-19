@@ -71,6 +71,7 @@ type SpotifyProvider struct {
 	pending         map[string]*pendingTracks
 	rootlistEntries []rootlistEntry     // ordered library incl. folders, from spclient
 	contextURIs     map[string][]string // playlist ID -> ordered track URIs, from spclient
+	apiMode         apiMode             // which read path to prefer; see CLIAMP_SPOTIFY_API
 	authCancel      context.CancelFunc  // cancels any in-progress OAuth flow
 
 	// Playlist list cache to avoid redundant API calls on provider switch.
@@ -79,6 +80,12 @@ type SpotifyProvider struct {
 }
 
 const playlistListCacheTTL = 5 * time.Minute
+
+// webTracksAttemptBudget bounds the Web API attempt for a playlist that has a
+// client-protocol fallback available. A page normally returns well inside a
+// second; the budget exists so a throttled account falls through quickly rather
+// than spending the caller's whole deadline in a retry backoff.
+const webTracksAttemptBudget = 6 * time.Second
 
 // New creates a SpotifyProvider. If session is nil, authentication is
 // deferred until the user first selects the Spotify provider.
@@ -91,6 +98,7 @@ func New(session *Session, clientID string, bitrate int) *SpotifyProvider {
 		trackCache:  make(map[string]*playlistCache),
 		pending:     make(map[string]*pendingTracks),
 		contextURIs: make(map[string][]string),
+		apiMode:     resolveAPIMode(),
 	}
 }
 
@@ -481,28 +489,49 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 	return slices.Clone(all), nil
 }
 
-// fetchTracksPage reads one page of a playlist's tracks and returns it with the
-// list's current total. Saved tracks and playlist items come from different
-// endpoints with different shapes, so this is the single place that difference
-// lives; both Tracks and TracksPage page through it so they cannot drift apart.
-// Items without an ID -- local files, unavailable tracks -- are skipped, so the
-// returned slice is usually shorter than the page size and the caller must
-// advance by the page size rather than by len(tracks).
+// fetchTracksPage reads one page of a playlist, preferring the documented Web
+// API and reaching for the client protocol only when it refuses. Spotify serves
+// the user's own playlists there, so the common case stays on the documented
+// path; a playlist owned by someone else, or a Spotify-owned mix, comes back
+// 403 and is readable only through the client protocol.
 func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, error) {
-	// Ordinary playlists go through Spotify's client protocol, which reads the
-	// ones the Web API refuses -- another user's list, a Spotify-owned mix --
-	// and is not subject to its quota. Saved tracks stay on the Web API: they
-	// are the user's own data, so it serves them, and there is no context URI
-	// for the collection. Fall back to the Web API if the client protocol is
-	// unavailable, since an older listing beats no tracks at all.
-	if playlistID != savedTracksPlaylistID {
-		tracks, total, err := p.contextTracksPage(ctx, playlistID, offset)
-		if err == nil {
-			return tracks, total, nil
-		}
-		applog.Warn("spotify: context resolve failed for %q, falling back to the web api: %v", playlistID, err)
+	fallback := playlistID != savedTracksPlaylistID && p.apiMode.usesClient()
+
+	webCtx := ctx
+	if fallback {
+		// A refusal comes back at once, but a throttled Web API can sit in its
+		// retry backoff for the caller's whole deadline. With somewhere else to
+		// go, waiting that out helps nobody: bound the attempt and move on.
+		var cancel context.CancelFunc
+		webCtx, cancel = context.WithTimeout(ctx, webTracksAttemptBudget)
+		defer cancel()
 	}
 
+	tracks, total, err := p.webTracksPage(webCtx, playlistID, offset)
+	if err == nil {
+		return tracks, total, nil
+	}
+	if !fallback {
+		return nil, 0, err
+	}
+	applog.Warn("spotify: web api declined %q (%v), trying the client protocol", playlistID, err)
+	tracks, total, cerr := p.contextTracksPage(ctx, playlistID, offset)
+	if cerr != nil {
+		// Report the Web API's refusal: it is the documented path and its error
+		// says why the playlist is unreadable.
+		applog.Warn("spotify: client protocol also failed for %q: %v", playlistID, cerr)
+		return nil, 0, err
+	}
+	return tracks, total, nil
+}
+
+// webTracksPage reads one page of a playlist's tracks through the Web API and
+// returns it with the list's current total. Saved tracks and playlist items
+// come from different endpoints with different shapes, so this is the single
+// place that difference lives. Items without an ID -- local files, unavailable
+// tracks -- are skipped, so the returned slice is usually shorter than the page
+// size and the caller must advance by the page size rather than by len(tracks).
+func (p *SpotifyProvider) webTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, error) {
 	query := url.Values{
 		"limit":  {strconv.Itoa(spotifyTrackPageSize)},
 		"offset": {strconv.Itoa(offset)},
