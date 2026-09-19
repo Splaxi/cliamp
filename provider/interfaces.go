@@ -408,3 +408,10 @@ type FavoritesManager interface {
 type TrackPager interface {
 	TracksPage(playlistID string, offset int) (tracks []playlist.Track, next int, err error)
 }
+
+// RadioStarter is implemented by providers that can build a station from a
+// track: the endless mix a service generates from one song. The name is
+// whatever the service calls the station, for the UI to report.
+type RadioStarter interface {
+	TrackRadio(ctx context.Context, trackPath string) (name string, tracks []playlist.Track, err error)
+}

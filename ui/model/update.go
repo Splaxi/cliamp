@@ -417,6 +417,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		cmd := m.startCatalogLoading()
 		return m, cmd
 
+	case trackRadioMsg:
+		if msg.gen != m.requests.tracks || !m.isActiveProvider(msg.providerName) {
+			return m, nil
+		}
+		m.provLoading = false
+		m.tracksPaging = false
+		if msg.err != nil {
+			m.status.Errorf(statusTTLDefault, "Radio failed: %s", msg.err)
+			return m, nil
+		}
+		if len(msg.tracks) == 0 {
+			m.status.Warningf(statusTTLDefault, "Radio came back empty")
+			return m, nil
+		}
+		// A station is a fresh queue rather than an addition: the point is to
+		// leave what you were listening to and follow the seed instead.
+		m.replacePlayerPlaylist(msg.tracks)
+		m.playlist.SetIndex(0)
+		m.plCursor = 0
+		m.adjustScroll()
+		m.status.Successf(statusTTLDefault, "Radio from %s — %d tracks", trackViewName(msg.seed), len(msg.tracks))
+		cmd := m.playCurrentTrack()
+		m.notifyAll()
+		return m, cmd
+
 	case tracksLoadedMsg:
 		if msg.gen != m.requests.tracks || !m.isActiveProvider(msg.providerName) {
 			return m, nil

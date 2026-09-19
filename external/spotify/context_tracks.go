@@ -7,6 +7,7 @@ import (
 
 	extmetapb "github.com/devgianlu/go-librespot/proto/spotify/extendedmetadata"
 	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
+	playerpb "github.com/devgianlu/go-librespot/proto/spotify/player"
 
 	"github.com/bjarneo/cliamp/playlist"
 )
@@ -134,4 +135,54 @@ func (p *SpotifyProvider) contextTracksPage(ctx context.Context, playlistID stri
 		return nil, 0, err
 	}
 	return tracks, len(uris), nil
+}
+
+// TrackRadio builds the station Spotify generates from a track -- what its own
+// clients call song radio. The station resolves to track URIs like any other
+// context, so the metadata is filled in the same way.
+//
+// Implements provider.RadioStarter.
+func (p *SpotifyProvider) TrackRadio(ctx context.Context, trackPath string) (string, []playlist.Track, error) {
+	if err := p.ensureSession(); err != nil {
+		return "", nil, err
+	}
+	if !strings.HasPrefix(trackPath, "spotify:track:") {
+		return "", nil, fmt.Errorf("spotify: radio: %q is not a spotify track", trackPath)
+	}
+	sess := p.session
+	if sess == nil || sess.sess == nil {
+		return "", nil, fmt.Errorf("spotify: radio: no session")
+	}
+
+	uri := trackPath
+	station, err := sess.sess.Spclient().ContextResolveAutoplay(ctx, &playerpb.AutoplayContextRequest{ContextUri: &uri})
+	if err != nil {
+		return "", nil, fmt.Errorf("spotify: radio for %q: %w", trackPath, err)
+	}
+
+	var uris []string
+	for _, page := range station.GetPages() {
+		for _, tr := range page.GetTracks() {
+			if u := tr.GetUri(); strings.HasPrefix(u, "spotify:track:") {
+				uris = append(uris, u)
+			}
+		}
+	}
+	if len(uris) == 0 {
+		return "", nil, fmt.Errorf("spotify: radio for %q: station is empty", trackPath)
+	}
+
+	// Stations come back around fifty tracks long, which is one metadata batch.
+	// Resolve in page-sized chunks anyway so a longer one cannot build a single
+	// oversized request.
+	tracks := make([]playlist.Track, 0, len(uris))
+	for start := 0; start < len(uris); start += spotifyTrackPageSize {
+		end := min(start+spotifyTrackPageSize, len(uris))
+		batch, err := p.trackMetadata(ctx, uris[start:end])
+		if err != nil {
+			return "", nil, err
+		}
+		tracks = append(tracks, batch...)
+	}
+	return station.GetUri(), tracks, nil
 }

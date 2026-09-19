@@ -175,3 +175,33 @@ func (m Model) playlistTrackStarred(track playlist.Track) bool {
 	}
 	return track.Bookmark
 }
+
+// startTrackRadio replaces the queue with the station the provider builds from
+// the selected track -- the endless mix a service generates from one song.
+// Providers that cannot do it simply say so rather than failing quietly.
+func (m *Model) startTrackRadio() tea.Cmd {
+	starter, ok := m.provider.(provider.RadioStarter)
+	if !ok {
+		m.status.Warningf(statusTTLDefault, "%s cannot start a radio", providerLabel(m.provider))
+		return nil
+	}
+	if m.focus != focusPlaylist || m.plCursor < 0 || m.plCursor >= m.playlist.Len() {
+		m.status.Warningf(statusTTLDefault, "Select a track to start its radio")
+		return nil
+	}
+	track, ok := m.playlist.Track(m.plCursor)
+	if !ok {
+		return nil
+	}
+
+	m.status.Activityf(statusTTLDefault, "Starting radio from %s…", trackViewName(track))
+	return startTrackRadioCmd(starter, m.provider.Name(), track, nextRequest(&m.requests.tracks))
+}
+
+// providerLabel names the active provider for a status line.
+func providerLabel(prov playlist.Provider) string {
+	if prov == nil {
+		return "This provider"
+	}
+	return prov.Name()
+}

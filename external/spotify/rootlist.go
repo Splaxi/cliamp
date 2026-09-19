@@ -175,19 +175,38 @@ func (p *SpotifyProvider) rememberRootlistLocked(entries []rootlistEntry) {
 	p.rootlistEntries = slices.Clone(entries)
 }
 
-// rootlistPlaylists converts library entries into the provider's playlist rows,
-// skipping folder boundaries. Ownership decides the section, matching what the
-// Web API path reports.
+// rootlistPlaylists converts library entries into the provider's playlist rows.
+// Folder boundaries do not become rows of their own: the pane already draws a
+// heading whenever the section changes, so naming a playlist's enclosing folder
+// as its section renders the library grouped the way Spotify shows it, in
+// Spotify's own order, without a tree widget. Playlists outside any folder keep
+// the ownership sections the Web API path uses.
 func (p *SpotifyProvider) rootlistPlaylists(entries []rootlistEntry, userID string) []playlist.PlaylistInfo {
 	lists := make([]playlist.PlaylistInfo, 0, len(entries))
+	var folders []string // innermost last
+
 	for _, e := range entries {
-		if e.isFolder() {
+		switch {
+		case e.isFolder() && e.FolderOpen:
+			folders = append(folders, e.Name)
+			continue
+		case e.isFolder():
+			if len(folders) > 0 {
+				folders = folders[:len(folders)-1]
+			}
 			continue
 		}
+
 		section := "Followed playlists"
 		if userID != "" && e.Owner == userID {
 			section = "Your playlists"
 		}
+		if len(folders) > 0 {
+			// Nested folders read as a path so a child is distinguishable from
+			// a sibling of its parent.
+			section = strings.Join(folders, " / ")
+		}
+
 		lists = append(lists, playlist.PlaylistInfo{
 			ID:         playlistIDFromURI(e.URI),
 			Name:       e.Name,
