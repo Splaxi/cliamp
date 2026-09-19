@@ -99,8 +99,9 @@ func (p *SpotifyProvider) trackMetadata(ctx context.Context, uris []string) ([]p
 }
 
 // trackFromMetadata converts Spotify's internal track message into a playlist
-// entry. Duration arrives in milliseconds and artists as a list, matching how
-// trackFromItem treats the Web API's shape.
+// entry, populating the same fields trackFromItem does from the Web API's
+// shape. Duration arrives in milliseconds, artists as a list, and the year on
+// the album rather than as a release-date string.
 func trackFromMetadata(uri string, tr *metadatapb.Track) playlist.Track {
 	names := make([]string, 0, len(tr.GetArtist()))
 	for _, a := range tr.GetArtist() {
@@ -113,9 +114,17 @@ func trackFromMetadata(uri string, tr *metadatapb.Track) playlist.Track {
 		Title:        tr.GetName(),
 		Artist:       strings.Join(names, ", "),
 		Album:        tr.GetAlbum().GetName(),
+		Year:         int(tr.GetAlbum().GetDate().GetYear()),
 		DurationSecs: int(tr.GetDuration()) / 1000,
 		TrackNumber:  int(tr.GetNumber()),
 		Stream:       false,
+		// Unplayable is deliberately left false, which matches what the Web API
+		// path produces: it derives the flag from is_playable and restrictions,
+		// and Spotify only populates those when a market is supplied, which
+		// cliamp never does. The client protocol does carry real per-country
+		// restrictions, so this could be made accurate here -- but only once
+		// the account's country is known, and doing it on one path alone would
+		// make the two disagree.
 	}
 }
 
