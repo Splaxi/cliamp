@@ -454,6 +454,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.err = nil
 				return m, nil
 			}
+			if errors.Is(msg.err, playlist.ErrRateLimited) {
+				// A cooldown passes on its own, and the message says how long.
+				// Keeping it in the permanent slot would sit in front of every
+				// later status for the rest of the session.
+				m.status.Warningf(statusTTLDefault, "Spotify is rate limiting — %s", msg.err)
+				return m, nil
+			}
 			if errors.Is(msg.err, playlist.ErrListChanged) {
 				// The list moved under a paged read, so what is on screen is a
 				// partial view of a list that no longer exists. Say so and let it

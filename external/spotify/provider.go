@@ -204,11 +204,20 @@ func (p *SpotifyProvider) currentUserID(ctx context.Context) string {
 	}
 	p.mu.Unlock()
 
+	// This only decides whether a playlist is labelled "Your" or "Followed", so
+	// it gets a deadline of its own. Sharing the caller's meant a throttled
+	// /v1/me could spend the whole budget here and leave the pane with nothing
+	// to show, having never reached the request that matters.
+	idCtx, cancel := context.WithTimeout(ctx, currentUserBudget)
+	defer cancel()
+
 	var me struct {
 		ID string `json:"id"`
 	}
-	if resp, err := p.webAPI(ctx, "GET", "/v1/me", nil); err == nil {
+	if resp, err := p.webAPI(idCtx, "GET", "/v1/me", nil); err == nil {
 		_ = decodeBody(resp, &me)
+	} else {
+		applog.Warn("spotify: could not identify the account, playlists will not be split by owner: %v", err)
 	}
 
 	p.mu.Lock()
@@ -862,6 +871,36 @@ func (p *SpotifyProvider) NewStreamer(uri string) (beep.StreamSeekCloser, beep.F
 	return nil, beep.Format{}, 0, fmt.Errorf("spotify: stream auth error after silent reconnect: %w", playlist.ErrNeedsAuth)
 }
 
+// Rate-limit handling mirrors external/tidal: cap what a Retry-After can ask
+// for, and retry only a couple of times. Spotify escalates a cooldown when it
+// is asked again during one -- a second becomes a minute becomes a day -- so
+// waiting out a long hold is both useless and harmful. go-librespot, which
+// cliamp already uses for playback, reaches the same conclusion for the same
+// endpoint family: "4xx isn't transient: retrying (especially a 429) just adds
+// load [...] a 429 carries a cooldown".
+// currentUserBudget bounds the account lookup that only labels sections.
+const currentUserBudget = 5 * time.Second
+
+const (
+	rateLimitRetries = 2
+	rateLimitWaitCap = 60 * time.Second
+)
+
+// retryAfter returns how long the server asked the caller to wait, or zero when
+// it did not say. Values beyond the cap are returned as asked so the caller can
+// report them; they are not waited out.
+func retryAfter(h http.Header) time.Duration {
+	v := strings.TrimSpace(h.Get("Retry-After"))
+	if v == "" {
+		return 0
+	}
+	secs, err := strconv.Atoi(v)
+	if err != nil || secs <= 0 {
+		return 0
+	}
+	return time.Duration(secs) * time.Second
+}
+
 // webAPI calls the Spotify Web API via the session with retry on 429.
 func (p *SpotifyProvider) webAPI(ctx context.Context, method, path string, query url.Values) (*http.Response, error) {
 	return p.webAPIWithBody(ctx, method, path, query, nil, "", http.StatusOK)
@@ -871,7 +910,6 @@ func (p *SpotifyProvider) webAPI(ctx context.Context, method, path string, query
 // and a set of acceptable HTTP status codes (e.g. 200, 201). Retries 429 with
 // exponential backoff (honoring Retry-After when present).
 func (p *SpotifyProvider) webAPIWithBody(ctx context.Context, method, path string, query url.Values, body io.Reader, contentType string, acceptStatus ...int) (*http.Response, error) {
-	const maxRetries = 8
 
 	// Buffer the body so it can be replayed on retry.
 	var bodyBytes []byte
@@ -883,7 +921,7 @@ func (p *SpotifyProvider) webAPIWithBody(ctx context.Context, method, path strin
 		}
 	}
 
-	for attempt := range maxRetries {
+	for attempt := 0; ; attempt++ {
 		var reqBody io.Reader
 		if bodyBytes != nil {
 			reqBody = bytes.NewReader(bodyBytes)
@@ -895,18 +933,21 @@ func (p *SpotifyProvider) webAPIWithBody(ctx context.Context, method, path strin
 		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
-			// On the last attempt there's no retry after the wait, so don't
-			// sleep (up to 128s) just to give up; fail now.
-			if attempt == maxRetries-1 {
-				break
+			asked := retryAfter(resp.Header)
+
+			// Asking again during a cooldown is what makes Spotify extend it:
+			// a one second hold becomes a minute, then a day. Retry only a
+			// hold short enough to be worth waiting out, and only twice.
+			if attempt >= rateLimitRetries || asked > rateLimitWaitCap {
+				applog.UserWarn("spotify: rate limited on %s, asked to wait %v", path, asked)
+				return nil, fmt.Errorf("spotify: rate limited on %s, retry in %v: %w", path, asked, playlist.ErrRateLimited)
 			}
-			wait := time.Duration(1<<uint(attempt)) * time.Second
-			if ra := resp.Header.Get("Retry-After"); ra != "" {
-				if secs, err := strconv.Atoi(ra); err == nil && secs > 0 {
-					wait = time.Duration(secs) * time.Second
-				}
+
+			wait := asked
+			if wait <= 0 {
+				wait = time.Duration(attempt+1) * time.Second
 			}
-			applog.UserWarn("spotify: web api rate-limited on %s, retrying in %v (attempt %d/%d)", path, wait, attempt+1, maxRetries)
+			applog.UserWarn("spotify: rate limited on %s, retrying in %v (attempt %d/%d)", path, wait, attempt+1, rateLimitRetries)
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
@@ -926,7 +967,6 @@ func (p *SpotifyProvider) webAPIWithBody(ctx context.Context, method, path strin
 		}
 		return resp, nil
 	}
-	return nil, fmt.Errorf("spotify: web api rate-limited on %s after %d retries (try re-authenticating)", path, maxRetries)
 }
 
 // devModeSearchLimit is the largest per-request limit /v1/search accepts for an
