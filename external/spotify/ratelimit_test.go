@@ -70,3 +70,33 @@ func TestRateLimitIsReportedNotWaitedOut(t *testing.T) {
 		})
 	}
 }
+
+// A refusal applies to the whole list, not one page. Asking again for every
+// later page costs a request per page and keeps pressure on an API that is
+// already refusing, which is how a cooldown gets extended.
+func TestWebAPIIsAskedOncePerRead(t *testing.T) {
+	webCalls, clientCalls := 0, 0
+	original := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if strings.HasPrefix(req.URL.Path, "/v1/") {
+			webCalls++
+			h := make(http.Header)
+			h.Set("Retry-After", "3287")
+			return &http.Response{StatusCode: http.StatusTooManyRequests, Status: "429 Too Many Requests",
+				Header: h, Body: io.NopCloser(strings.NewReader(`{}`)), Request: req}, nil
+		}
+		clientCalls++
+		return nil, fmt.Errorf("no client session in this test")
+	})
+	t.Cleanup(func() { http.DefaultTransport = original })
+
+	sess := &Session{tokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "t"})}
+	p := New(sess, "client", 320)
+
+	for offset := 0; offset < 300; offset += spotifyTrackPageSize {
+		_, _, _, _ = p.fetchTracksPage(t.Context(), "somelist", offset)
+	}
+	if webCalls > 1 {
+		t.Errorf("asked the web api %d times for one read; it refused on the first", webCalls)
+	}
+}

@@ -401,6 +401,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.provLoading = m.provSearch.loading
 		if msg.err != nil {
+			if errors.Is(msg.err, playlist.ErrRateLimited) {
+				// A cooldown passes on its own, so it does not belong in the
+				// slot that has no expiry and hides every later status.
+				m.status.Warningf(statusTTLDefault, "Spotify is rate limiting — %s", msg.err)
+				return m, nil
+			}
 			if errors.Is(msg.err, playlist.ErrNeedsAuth) {
 				m.provSignIn = true
 				m.err = nil
