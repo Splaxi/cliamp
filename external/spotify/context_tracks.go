@@ -32,7 +32,7 @@ func (p *SpotifyProvider) contextTrackURIs(ctx context.Context, playlistID strin
 	if sess == nil || sess.sess == nil {
 		return nil, fmt.Errorf("spotify: context resolve: no session")
 	}
-	content, err := sess.sess.Spclient().ContextResolve(ctx, "spotify:playlist:"+playlistID)
+	content, err := sess.sess.Spclient().ContextResolve(ctx, contextURIFor(playlistID))
 	if err != nil {
 		return nil, fmt.Errorf("spotify: context resolve %q: %w", playlistID, err)
 	}
@@ -50,6 +50,16 @@ func (p *SpotifyProvider) contextTrackURIs(ctx context.Context, playlistID strin
 	p.contextURIs[playlistID] = uris
 	p.mu.Unlock()
 	return uris, nil
+}
+
+// contextURIFor names the context a list resolves through. Liked Songs is not
+// a playlist and has no playlist URI, but it is addressable as the saved-track
+// collection, which resolves like any other context.
+func contextURIFor(playlistID string) string {
+	if playlistID == savedTracksPlaylistID {
+		return "spotify:collection:tracks"
+	}
+	return "spotify:playlist:" + playlistID
 }
 
 // trackMetadata resolves a batch of track URIs to full tracks in one request.

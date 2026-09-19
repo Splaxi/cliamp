@@ -497,10 +497,8 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 // path; a playlist owned by someone else, or a Spotify-owned mix, comes back
 // 403 and is readable only through the client protocol.
 func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, error) {
-	fallback := playlistID != savedTracksPlaylistID && p.apiMode.usesClient()
+	fallback := p.apiMode.usesClient()
 
-	// Saved tracks have no context URI, so they stay on the Web API whatever
-	// the mode asks for.
 	if fallback && p.apiMode.skipsWeb() {
 		return p.contextTracksPage(ctx, playlistID, offset)
 	}
