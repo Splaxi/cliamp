@@ -235,17 +235,19 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	// Spotify's own client protocol returns the whole library in one request,
-	// including folders and the entries the Web API declines to list. Fall back
-	// to the Web API when it is unavailable: it is an internal endpoint, so a
-	// working listing matters more than the richer one.
-	if lists, err := p.playlistsFromRootlist(ctx); err == nil {
-		p.mu.Lock()
-		p.listCache = lists
-		p.listCacheAt = time.Now()
-		p.mu.Unlock()
-		return slices.Clone(lists), nil
-	} else {
+	// The listing is the one place the client protocol leads rather than
+	// follows: the Web API does not fail here, it just answers with less --
+	// no folders, and none of the entries it declines to serve. Falling back
+	// still beats no listing at all, since this is an internal endpoint.
+	if p.apiMode.usesClient() {
+		lists, err := p.playlistsFromRootlist(ctx)
+		if err == nil {
+			p.mu.Lock()
+			p.listCache = lists
+			p.listCacheAt = time.Now()
+			p.mu.Unlock()
+			return slices.Clone(lists), nil
+		}
 		applog.Warn("spotify: rootlist unavailable, falling back to the web api: %v", err)
 	}
 
@@ -496,6 +498,12 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 // 403 and is readable only through the client protocol.
 func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, error) {
 	fallback := playlistID != savedTracksPlaylistID && p.apiMode.usesClient()
+
+	// Saved tracks have no context URI, so they stay on the Web API whatever
+	// the mode asks for.
+	if fallback && p.apiMode.skipsWeb() {
+		return p.contextTracksPage(ctx, playlistID, offset)
+	}
 
 	webCtx := ctx
 	if fallback {

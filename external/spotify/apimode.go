@@ -16,8 +16,8 @@ const (
 	// apiModeAuto prefers the client protocol and falls back to the Web API, so
 	// an endpoint disappearing costs the extra reach rather than the feature.
 	apiModeAuto apiMode = iota
-	// apiModeClient never falls back, so a broken internal endpoint surfaces
-	// instead of being masked. Intended for testing.
+	// apiModeClient bypasses the Web API, so a broken internal endpoint
+	// surfaces instead of being masked by a fallback. Intended for testing.
 	apiModeClient
 	// apiModeWeb never uses the client protocol, reproducing the behaviour
 	// cliamp had before it was introduced. An escape hatch as well as a test
@@ -41,11 +41,12 @@ func resolveAPIMode() apiMode {
 	}
 }
 
-// usesClient reports whether the client protocol may be tried.
+// usesClient reports whether the client protocol may be used at all.
 func (m apiMode) usesClient() bool { return m != apiModeWeb }
 
-// allowsWebFallback reports whether a client-protocol failure may fall back.
-func (m apiMode) allowsWebFallback() bool { return m != apiModeClient }
+// skipsWeb reports whether the Web API should be bypassed entirely, so that a
+// broken internal endpoint surfaces instead of being masked by a fallback.
+func (m apiMode) skipsWeb() bool { return m == apiModeClient }
 
 // String names the mode for logs.
 func (m apiMode) String() string {
