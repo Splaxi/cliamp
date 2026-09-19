@@ -541,3 +541,39 @@ func TestTracksPageServesSavedAlbumsWholly(t *testing.T) {
 		}
 	}
 }
+
+// On the client path a page is sliced from a resolved URI list, so validating a
+// resume against a cached resolve would be the snapshot the abandoned chain
+// started from agreeing with itself. The cached resolve must be dropped before
+// page 0 is fetched, so the proof describes the library now.
+func TestTracksPageReresolvesBeforeProvingAResume(t *testing.T) {
+	calls := 0
+	p := savedTracksProvider(t, 200, &calls)
+
+	if _, next, err := p.TracksPage("YOUR MUSIC", 0); err != nil || next != 50 {
+		t.Fatalf("page 0: next=%d err=%v", next, err)
+	}
+	if _, _, err := p.TracksPage("YOUR MUSIC", 50); err != nil {
+		t.Fatal(err)
+	}
+
+	// Stand in for the resolve the abandoned chain was reading from.
+	p.mu.Lock()
+	if p.pending["YOUR MUSIC"] == nil {
+		p.mu.Unlock()
+		t.Fatal("no accumulation to resume; the test no longer covers its case")
+	}
+	p.contextURIs["YOUR MUSIC"] = []string{"spotify:track:stale"}
+	p.mu.Unlock()
+
+	if _, _, err := p.TracksPage("YOUR MUSIC", 0); err != nil {
+		t.Fatal(err)
+	}
+
+	p.mu.Lock()
+	_, kept := p.contextURIs["YOUR MUSIC"]
+	p.mu.Unlock()
+	if kept {
+		t.Error("resume kept the cached resolve, so it validated against the snapshot it started from")
+	}
+}

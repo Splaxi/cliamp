@@ -37,9 +37,20 @@ func (p *SpotifyProvider) contextTrackURIs(ctx context.Context, playlistID strin
 		return nil, fmt.Errorf("spotify: context resolve %q: %w", playlistID, err)
 	}
 
+	// A resolve answers with every track inline: probed against this account's
+	// largest lists, a 6077-track collection and a 1693-track playlist each came
+	// back as one page with no continuation. The page type can carry one
+	// (next_page_url), though, and because the list length below becomes the
+	// total, a truncated resolve would look like a short list rather than an
+	// error. Refuse it instead and let the Web API serve the list.
 	var uris []string
 	for _, page := range content.GetPages() {
+		if page.GetNextPageUrl() != "" {
+			return nil, fmt.Errorf("spotify: context resolve %q: paged response", playlistID)
+		}
 		for _, tr := range page.GetTracks() {
+			// Podcast episodes and the user's own local files ride in the same
+			// list; neither is playable from here, so only tracks are kept.
 			if uri := tr.GetUri(); strings.HasPrefix(uri, "spotify:track:") {
 				uris = append(uris, uri)
 			}

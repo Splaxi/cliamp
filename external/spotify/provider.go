@@ -61,19 +61,18 @@ type pendingTracks struct {
 }
 
 type SpotifyProvider struct {
-	session         *Session
-	clientID        string
-	bitrate         int
-	userID          string // Spotify user ID, fetched lazily on first Playlists() call
-	meFetched       bool   // /v1/me has been attempted this session; suppresses retry on failure
-	mu              sync.Mutex
-	trackCache      map[string]*playlistCache // playlist ID → cache entry
-	pending         map[string]*pendingTracks
-	rootlistEntries []rootlistEntry     // ordered library incl. folders, from spclient
-	contextURIs     map[string][]string // playlist ID -> ordered track URIs, from spclient
-	declinedByWeb   map[string]bool     // playlist ID -> the web api refused it this read
-	apiMode         apiMode             // which read path to prefer; see CLIAMP_SPOTIFY_API
-	authCancel      context.CancelFunc  // cancels any in-progress OAuth flow
+	session       *Session
+	clientID      string
+	bitrate       int
+	userID        string // Spotify user ID, fetched lazily on first Playlists() call
+	meFetched     bool   // /v1/me has been attempted this session; suppresses retry on failure
+	mu            sync.Mutex
+	trackCache    map[string]*playlistCache // playlist ID → cache entry
+	pending       map[string]*pendingTracks
+	contextURIs   map[string][]string // playlist ID -> ordered track URIs, from spclient
+	declinedByWeb map[string]bool     // playlist ID -> the web api refused it this read
+	apiMode       apiMode             // which read path to prefer; see CLIAMP_SPOTIFY_API
+	authCancel    context.CancelFunc  // cancels any in-progress OAuth flow
 
 	// Playlist list cache to avoid redundant API calls on provider switch.
 	listCache   []playlist.PlaylistInfo
@@ -738,6 +737,19 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 	if hit && (playlistID != savedTracksPlaylistID || p.savedTracksUnchanged(ctx, tracks, cachedTotal)) {
 		return tracks, 0, nil
 	}
+	// A resume is proved by comparing the page just fetched against the
+	// accumulation. On the client path both would come from the URI list
+	// resolved when that accumulation began, so the proof would be the stale
+	// snapshot agreeing with itself. Drop the resolve so this page describes
+	// the library now; for Web-served reads there is nothing cached to drop.
+	if offset == 0 {
+		p.mu.Lock()
+		if p.pending[playlistID] != nil {
+			delete(p.contextURIs, playlistID)
+		}
+		p.mu.Unlock()
+	}
+
 	page, total, pageSize, err := p.fetchTracksPage(ctx, playlistID, offset)
 	if err != nil {
 		return nil, 0, err
@@ -797,6 +809,8 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 	// moved under it. Every later page would mismatch the pinned snapshot too,
 	// so the load can never commit -- stop now rather than spending the rest of
 	// the pages on a result that is already discarded.
+	// Only a Web-served read can reach this: the client path slices every page
+	// from one resolve, so its pages always agree on the total.
 	if pend.total != total {
 		p.discardLoadLocked(playlistID)
 		return nil, 0, fmt.Errorf("spotify: list tracks %q: %w", playlistID, playlist.ErrListChanged)

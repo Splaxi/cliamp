@@ -86,7 +86,7 @@ Saved albums appear under a **Saved albums** section, labelled `Artist - Album` 
 
 ## Podcasts
 
-Podcast episodes work as tracks. Press `Ctrl+F` to search Spotify. Matching episodes, such as "Joe Rogan", appear with songs. Press `Enter` to play. Playlists can load and play both songs and episodes.
+Podcast episodes work as tracks. Press `Ctrl+F` to search Spotify. Matching episodes, such as "Joe Rogan", appear with songs. Press `Enter` to play. Playlists can load and play both songs and episodes, except when a playlist is read through the client protocol -- see below -- which serves songs only.
 
 ## How Cliamp reads your library
 
@@ -101,6 +101,8 @@ Set `CLIAMP_SPOTIFY_API` to change this:
 | `auto` | Default. Web API first, client protocol for what it refuses. |
 | `client` | Client protocol only. Useful when the Web API is rate limiting, and it makes a broken internal endpoint visible rather than silently masked. |
 | `web` | Web API only. Cliamp's behaviour before the client protocol was added; folders, saved radios and other people's playlists are unavailable. |
+
+A playlist read through the client protocol serves songs only: podcast episodes and your own local files ride in the same list but cannot be played from there, so they are skipped. In `auto` this affects only playlists the Web API refused, which previously showed nothing at all.
 
 The client protocol is undocumented and can change without notice, which is why every path falls back to the Web API and why `web` exists as an escape hatch.
 

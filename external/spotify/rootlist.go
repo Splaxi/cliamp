@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"net/url"
-	"slices"
 	"strings"
 	"time"
 
@@ -74,10 +73,22 @@ func (p *SpotifyProvider) rootlist(ctx context.Context) ([]rootlistEntry, error)
 		return nil, fmt.Errorf("spotify: rootlist: parse: %w", err)
 	}
 
+	return parseRootlist(&content)
+}
+
+// parseRootlist turns a rootlist response into ordered entries. It is split out
+// from the request so the shapes Spotify can answer with stay testable.
+func parseRootlist(content *playlist4pb.SelectedListContent) ([]rootlistEntry, error) {
 	items := content.GetContents().GetItems()
 	// meta_items runs parallel to items and carries the name, track count and
-	// owner. It can be short or absent, so index defensively.
+	// owner. An entry without one is unnameable, and unnamed entries are hidden
+	// below -- so if none arrived at all, this undocumented endpoint answered a
+	// shape we cannot read, and silently hiding the whole library would be the
+	// worst way to say so. Fail instead, and let the Web API serve the list.
 	metas := content.GetContents().GetMetaItems()
+	if len(items) > 0 && len(metas) == 0 {
+		return nil, fmt.Errorf("spotify: rootlist: %d items without metadata", len(items))
+	}
 
 	entries := make([]rootlistEntry, 0, len(items))
 	for i, item := range items {
@@ -163,16 +174,7 @@ func (p *SpotifyProvider) playlistsFromRootlist(ctx context.Context) ([]playlist
 		applog.Warn("spotify: saved albums unavailable: %v", err)
 	}
 
-	p.mu.Lock()
-	p.rememberRootlistLocked(entries)
-	p.mu.Unlock()
 	return lists, nil
-}
-
-// rememberRootlistLocked keeps the ordered library, folders included, so a
-// later tree view can render it without another request. p.mu must be held.
-func (p *SpotifyProvider) rememberRootlistLocked(entries []rootlistEntry) {
-	p.rootlistEntries = slices.Clone(entries)
 }
 
 // rootlistPlaylists converts library entries into the provider's playlist rows.
@@ -183,16 +185,19 @@ func (p *SpotifyProvider) rememberRootlistLocked(entries []rootlistEntry) {
 // the ownership sections the Web API path uses.
 func (p *SpotifyProvider) rootlistPlaylists(entries []rootlistEntry, userID string) []playlist.PlaylistInfo {
 	lists := make([]playlist.PlaylistInfo, 0, len(entries))
-	var folders []string // innermost last
+	type openFolder struct{ id, name string }
+	var folders []openFolder // innermost last
 
 	for _, e := range entries {
 		switch {
 		case e.isFolder() && e.FolderOpen:
-			folders = append(folders, e.Name)
+			folders = append(folders, openFolder{id: e.FolderID, name: e.Name})
 			continue
 		case e.isFolder():
-			if len(folders) > 0 {
-				folders = folders[:len(folders)-1]
+			// Only close the folder this end-group actually names, so a
+			// malformed list cannot reparent everything that follows it.
+			if n := len(folders); n > 0 && folders[n-1].id == e.FolderID {
+				folders = folders[:n-1]
 			}
 			continue
 		}
@@ -208,7 +213,11 @@ func (p *SpotifyProvider) rootlistPlaylists(entries []rootlistEntry, userID stri
 		if len(folders) > 0 {
 			// Nested folders read as a path so a child is distinguishable from
 			// a sibling of its parent.
-			section = strings.Join(folders, " / ")
+			names := make([]string, len(folders))
+			for i, f := range folders {
+				names[i] = f.name
+			}
+			section = strings.Join(names, " / ")
 		}
 
 		lists = append(lists, playlist.PlaylistInfo{
