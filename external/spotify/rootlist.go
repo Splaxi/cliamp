@@ -197,6 +197,10 @@ func (p *SpotifyProvider) rootlistPlaylists(entries []rootlistEntry, userID stri
 			continue
 		}
 
+		if skipRootlistEntry(e) {
+			continue
+		}
+
 		section := "Followed playlists"
 		if userID != "" && e.Owner == userID {
 			section = "Your playlists"
@@ -215,4 +219,20 @@ func (p *SpotifyProvider) rootlistPlaylists(entries []rootlistEntry, userID stri
 		})
 	}
 	return lists
+}
+
+// spotifyOwner is the owner the library reports for Spotify's own entries.
+const spotifyOwner = "spotify"
+
+// skipRootlistEntry reports whether a library entry cannot be presented as a
+// playlist. The library keeps references Spotify no longer serves -- they
+// arrive with no name and resolve 404 -- and Spotify-owned entries with no
+// tracks, such as DJ, which are generated live rather than being a list. A
+// user's own empty playlist is still worth showing, so emptiness alone is not
+// enough to hide something.
+func skipRootlistEntry(e rootlistEntry) bool {
+	if e.Name == "" {
+		return true
+	}
+	return e.Owner == spotifyOwner && e.TrackCount == 0
 }
