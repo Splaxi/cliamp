@@ -921,17 +921,23 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 	}
 
 	// A continuation slices the resolve its own read started from. Page zero
-	// passes none, so it takes a fresh one.
-	var carried []string
+	// passes none, so it takes a fresh one. The accumulation itself is carried
+	// by pointer: the fetch below runs unlocked, and a page-zero re-entry can
+	// replace the accumulation while the page is in flight -- so at commit the
+	// page must be proven to belong to the accumulation still standing, not
+	// merely to one that was standing when the page was asked for.
+	var carried *pendingTracks
+	var carriedURIs []string
 	if offset > 0 {
 		p.mu.Lock()
 		if pend := p.pending[playlistID]; pend != nil && pend.want == offset {
-			carried = pend.uris
+			carried = pend
+			carriedURIs = pend.uris
 		}
 		p.mu.Unlock()
 	}
 
-	result, err := p.fetchTracksPage(ctx, playlistID, offset, carried)
+	result, err := p.fetchTracksPage(ctx, playlistID, offset, carriedURIs)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -945,11 +951,16 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 	}
 
 	// Whether an abandoned accumulation can be resumed may need a request, so
-	// settle it before taking the lock the accumulation is guarded by.
+	// settle it before taking the lock the accumulation is guarded by. The
+	// proof is against this accumulation by pointer: it can also be replaced
+	// while the probe is in flight, and adopting into a stranger would hand it
+	// a resolve its pages never came from.
 	resumable := false
+	var proofPend *pendingTracks
 	if offset == 0 {
 		p.mu.Lock()
 		pend := p.pending[playlistID]
+		proofPend = pend
 		viable := pend != nil && pend.want > 0 && pend.total == total
 		head := viable && playlistID == savedTracksPlaylistID && headMatches(pend.tracks, page)
 		snapshot := ""
@@ -976,7 +987,7 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 		// Re-entering a list abandoned mid-load resumes the earlier accumulation
 		// rather than refetching every page already paid for, at the cost of one
 		// request to prove nothing moved in between.
-		if resumable && pend != nil {
+		if resumable && pend != nil && pend == proofPend {
 			// The fresh resolve just proved equal to the accumulation at total
 			// and head, so the remaining pages come from it rather than from
 			// the one the abandoned read was holding.
@@ -987,8 +998,12 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 		p.pending[playlistID] = pend
 	}
 	// A page at an offset this accumulation is not waiting for belongs to a
-	// superseded chain: serve it to its caller, but do not accumulate it.
-	if pend == nil || pend.want != offset {
+	// superseded chain: serve it to its caller, but do not accumulate it. That
+	// includes a continuation whose accumulation was replaced while its page
+	// was in flight -- its pages come from the replaced read's resolve, and a
+	// same-total edit is exactly why the replacement happened, which no total
+	// check could catch.
+	if pend == nil || pend.want != offset || (offset > 0 && pend != carried) {
 		return page, next, nil
 	}
 	// The live chain's own page reporting a different total means the library

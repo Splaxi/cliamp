@@ -837,6 +837,153 @@ func TestOrdinaryPlaylistsStillLeadWithTheWebAPI(t *testing.T) {
 	}
 }
 
+// A continuation slices the resolve its own accumulation holds, but the fetch
+// happens outside the lock, and a page-zero re-entry -- a second daemon
+// connection re-opening the list -- can replace the accumulation while that
+// page is in flight. When the replacement happened because the library moved,
+// the in-flight page still belongs to the dead read's snapshot, and a
+// same-total edit is exactly the replacement reason that no later total check
+// can catch. The page must be served to its caller, never accumulated into the
+// read that replaced it.
+func TestTracksPageDoesNotAccumulateIntoAReplacedRead(t *testing.T) {
+	snapshot := "snap-1"
+	oldList := make([]string, 200)
+	newList := make([]string, 200)
+	for i := range oldList {
+		oldList[i] = fmt.Sprintf("spotify:track:p%d", i)
+		newList[i] = fmt.Sprintf("spotify:track:p%d", i)
+		if i >= 100 {
+			newList[i] = fmt.Sprintf("spotify:track:q%d", i) // edited below the head, same total
+		}
+	}
+	list := oldList
+
+	originalTransport := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/v1/playlists/alpha" {
+			return jsonResponse(req, fmt.Sprintf(`{"snapshot_id":%q}`, snapshot))
+		}
+		return nil, fmt.Errorf("unexpected Spotify API path %q", req.URL.Path)
+	})
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	sess := &Session{tokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "token"})}
+	p := New(sess, "client", 320)
+	p.apiMode = apiModeClient
+	p.trackCache["alpha"] = &playlistCache{snapshotID: snapshot}
+
+	serve := func(ctx context.Context, id string, off int, uris []string) (tracksPage, error) {
+		if uris == nil {
+			uris = list // a fresh resolve sees the library as it is now
+		}
+		page := tracksPage{total: len(uris), pageSize: 100, uris: uris}
+		for _, u := range uris[off:min(off+100, len(uris))] {
+			page.tracks = append(page.tracks, playlist.Track{Path: u})
+		}
+		return page, nil
+	}
+	p.clientPage = serve
+
+	// Read one takes page zero and is left mid-flight on the old snapshot.
+	if _, next, err := p.TracksPage("alpha", 0); err != nil || next != 100 {
+		t.Fatalf("page zero: next=%d err=%v", next, err)
+	}
+
+	// While read one's continuation is in flight, the playlist is edited to the
+	// same-length newList and a second reader re-enters at page zero, whose
+	// proof sees the new snapshot and restarts the accumulation.
+	inContinuation := false
+	p.clientPage = func(ctx context.Context, id string, off int, uris []string) (tracksPage, error) {
+		if off == 100 && !inContinuation {
+			inContinuation = true
+			list, snapshot = newList, "snap-2"
+			if _, _, err := p.TracksPage("alpha", 0); err != nil {
+				t.Fatalf("second reader's page zero: %v", err)
+			}
+			inContinuation = false
+		}
+		return serve(ctx, id, off, uris)
+	}
+
+	page, next, err := p.TracksPage("alpha", 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(page) != 100 || next != 0 {
+		t.Fatalf("continuation served %d tracks with next=%d, want 100 and 0", len(page), next)
+	}
+
+	pend := p.pending["alpha"]
+	if pend == nil {
+		t.Fatal("the replaced read's accumulation vanished: the superseded page completed it and it committed")
+	}
+	if len(pend.tracks) != 100 || pend.want != 100 {
+		t.Fatalf("replaced read's accumulation holds %d tracks at want %d, want 100 at 100", len(pend.tracks), pend.want)
+	}
+	for i, tr := range pend.tracks {
+		want := fmt.Sprintf("spotify:track:p%d", i)
+		if i >= 100 {
+			want = fmt.Sprintf("spotify:track:q%d", i)
+		}
+		if tr.Path != want {
+			t.Fatalf("accumulation[%d] = %s, want %s: a superseded page was spliced into the read that replaced it", i, tr.Path, want)
+		}
+	}
+	if cached := p.trackCache["alpha"]; cached != nil && cached.tracks != nil {
+		t.Error("a superseded page completed a read it does not belong to and committed the cache")
+	}
+}
+
+// The web API counts every playlist item; the client protocol's resolve keeps
+// tracks only, so the two can disagree about the total even with nothing
+// edited. When that mismatch restarts Tracks(), the restarted read must drop
+// the resolve the failed attempt was holding and take a fresh one, or it will
+// finish from a snapshot taken before whatever moved the total.
+func TestTracksRestartDropsTheResolveItWasHolding(t *testing.T) {
+	originalTransport := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path == "/v1/playlists/beta/items" && req.URL.Query().Get("offset") == "0" {
+			return jsonResponse(req, `{"items":[],"total":1005}`)
+		}
+		return nil, fmt.Errorf("http status 500 Internal Server Error")
+	})
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	sess := &Session{tokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "token"})}
+	p := New(sess, "client", 320)
+
+	uris := make([]string, 1000)
+	for i := range uris {
+		uris[i] = fmt.Sprintf("spotify:track:t%d", i)
+	}
+	var zeroOffsetCarries [][]string
+	p.clientPage = func(ctx context.Context, id string, off int, carried []string) (tracksPage, error) {
+		if off == 0 {
+			zeroOffsetCarries = append(zeroOffsetCarries, carried)
+		}
+		if carried == nil {
+			carried = uris
+		}
+		page := tracksPage{total: len(carried), pageSize: 100, uris: carried}
+		for _, u := range carried[off:min(off+100, len(carried))] {
+			page.tracks = append(page.tracks, playlist.Track{Path: u})
+		}
+		return page, nil
+	}
+
+	tracks, err := p.Tracks("beta")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(tracks) != 1000 {
+		t.Fatalf("collected %d tracks, want the resolve's 1000", len(tracks))
+	}
+	// The first page went to the Web API (total 1005), the first client page
+	// disagreed (1000) and restarted the read. That restart's page zero must
+	// have been handed nothing, so it took a fresh resolve.
+	if len(zeroOffsetCarries) != 1 || zeroOffsetCarries[0] != nil {
+		t.Errorf("the restarted read's page zero carried %v, want nil: it is slicing the failed attempt's snapshot", zeroOffsetCarries)
+	}
+}
+
 // A read slices every page from the snapshot it started with. Before the
 // resolve belonged to the read, it sat in a map keyed by playlist, so a second
 // reader of the same list -- reachable in daemon mode, where each IPC
