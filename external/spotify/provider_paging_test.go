@@ -720,3 +720,107 @@ func TestSavedTracksCheckLeavesALiveChainAlone(t *testing.T) {
 		t.Error("the check deleted a live chain's resolve, so its next page splices two snapshots")
 	}
 }
+
+// seedResolve stands in for a client-served read having resolved the list.
+func seedResolve(p *SpotifyProvider, playlistID string) {
+	p.mu.Lock()
+	p.contextURIs[playlistID] = []string{"spotify:track:a", "spotify:track:b"}
+	p.mu.Unlock()
+}
+
+func resolveHeld(p *SpotifyProvider, playlistID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	_, ok := p.contextURIs[playlistID]
+	return ok
+}
+
+// However a read ends, the snapshot it resolved must end with it. A resolve
+// that outlives its read would be sliced by the next one, which is the whole
+// list served from contents nothing revalidated.
+func TestReadEndsDropTheResolve(t *testing.T) {
+	t.Run("committed", func(t *testing.T) {
+		calls := 0
+		p := savedTracksProvider(t, 100, &calls)
+		seedResolve(p, "YOUR MUSIC")
+		if got := drainSavedTracks(t, p); got != 100 {
+			t.Fatalf("collected %d tracks, want 100", got)
+		}
+		if resolveHeld(p, "YOUR MUSIC") {
+			t.Error("the resolve outlived a completed read")
+		}
+	})
+
+	t.Run("abandoned on drift", func(t *testing.T) {
+		calls := 0
+		total := 120
+		p := stubSavedTracks(t, &calls, func(offset, limit int) string {
+			body := savedTracksBodyShift(offset, limit, total, 0)
+			if offset == 0 {
+				total++ // liked while page one was in flight
+			}
+			return body
+		})
+		seedResolve(p, "YOUR MUSIC")
+
+		var err error
+		for offset := 0; ; {
+			var next int
+			if _, next, err = p.TracksPage("YOUR MUSIC", offset); err != nil || next == 0 {
+				break
+			}
+			offset = next
+		}
+		if err == nil {
+			t.Fatal("a read spanning two snapshots ran to completion")
+		}
+		if resolveHeld(p, "YOUR MUSIC") {
+			t.Error("the resolve outlived a read the library changed under")
+		}
+	})
+}
+
+// The client twin of this is pinned; without the web one, a refusal recorded
+// by the Web API could outlive its read and send every later read of that list
+// to the undocumented endpoint until the process exits.
+func TestTracksPageForgetsAWebDeclineFromAnAbandonedRead(t *testing.T) {
+	calls := 0
+	p := savedTracksProvider(t, 200, &calls)
+
+	p.noteWebDeclined("YOUR MUSIC")
+	if !p.webDeclined("YOUR MUSIC") {
+		t.Fatal("the decline was not recorded")
+	}
+
+	if _, _, err := p.TracksPage("YOUR MUSIC", 0); err != nil {
+		t.Fatal(err)
+	}
+	if p.webDeclined("YOUR MUSIC") {
+		t.Error("a web decline outlived the read that recorded it")
+	}
+}
+
+// Only Liked Songs leads with the client protocol. An ordinary playlist must
+// still try the Web API first, which is what keeps default behaviour unchanged.
+func TestOrdinaryPlaylistsStillLeadWithTheWebAPI(t *testing.T) {
+	calls := 0
+	snapshot, prefix := "snap-1", "t"
+	p := playlistStub(t, "somelist", 60, &snapshot, &prefix, &calls)
+
+	attempts := 0
+	real := p.clientPage
+	p.clientPage = func(ctx context.Context, id string, off int) ([]playlist.Track, int, int, error) {
+		attempts++
+		return real(ctx, id, off)
+	}
+
+	if _, _, err := p.TracksPage("somelist", 0); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 0 {
+		t.Errorf("an ordinary playlist reached the client protocol %d times before the Web API", attempts)
+	}
+	if calls == 0 {
+		t.Error("the Web API was never asked")
+	}
+}

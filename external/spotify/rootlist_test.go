@@ -237,3 +237,25 @@ func TestWebListingOnlyAdoptsClientSeededEntries(t *testing.T) {
 		}
 	})
 }
+
+// The library keeps references Spotify no longer serves, which arrive unnamed
+// and 404 when opened, and generated entries such as DJ that are not lists at
+// all. Showing either gives the user a row that cannot open. A user's own empty
+// playlist is still worth showing, so emptiness alone must not hide anything.
+func TestSkipRootlistEntry(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		e    rootlistEntry
+		skip bool
+	}{
+		{"unnamed reference", rootlistEntry{Name: "", TrackCount: 3, Owner: "listener"}, true},
+		{"spotify-owned and empty", rootlistEntry{Name: "DJ", TrackCount: 0, Owner: spotifyOwner}, true},
+		{"spotify-owned with tracks", rootlistEntry{Name: "Discover Weekly", TrackCount: 30, Owner: spotifyOwner}, false},
+		{"own empty playlist", rootlistEntry{Name: "Later", TrackCount: 0, Owner: "listener"}, false},
+		{"ordinary playlist", rootlistEntry{Name: "good stuff", TrackCount: 12, Owner: "listener"}, false},
+	} {
+		if got := skipRootlistEntry(tc.e); got != tc.skip {
+			t.Errorf("%s: skip = %v, want %v", tc.name, got, tc.skip)
+		}
+	}
+}
