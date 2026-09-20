@@ -108,27 +108,29 @@ func revEntry(id string, rev []byte) rootlistEntry {
 // it, a playlist edited elsewhere would serve its cached tracks forever.
 func TestApplyRevisionsDropsCacheWhenRevisionMoves(t *testing.T) {
 	p := &SpotifyProvider{
-		trackCache:  map[string]*playlistCache{},
-		contextURIs: map[string][]string{},
+		trackCache:       map[string]*playlistCache{},
+		pending:          map[string]*pendingTracks{},
+		declinedByWeb:    map[string]bool{},
+		declinedByClient: map[string]bool{},
 	}
 	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{1})})
 	p.trackCache["a"].tracks = []playlist.Track{{Path: "spotify:track:x"}}
-	p.contextURIs["a"] = []string{"spotify:track:x"}
+	p.pending["a"] = &pendingTracks{want: 1, total: 1, uris: []string{"spotify:track:x"}}
 
 	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{1})})
 	if p.trackCache["a"] == nil || len(p.trackCache["a"].tracks) != 1 {
 		t.Error("an unchanged revision dropped the cache")
 	}
-	if len(p.contextURIs["a"]) != 1 {
-		t.Error("an unchanged revision dropped the resolved URIs")
+	if pend := p.pending["a"]; pend == nil || len(pend.uris) != 1 {
+		t.Error("an unchanged revision discarded a live read")
 	}
 
 	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{2})})
 	if c := p.trackCache["a"]; c == nil || len(c.tracks) != 0 {
 		t.Error("a changed revision left the cached tracks in place")
 	}
-	if _, ok := p.contextURIs["a"]; ok {
-		t.Error("a changed revision left the resolved URIs in place")
+	if _, ok := p.pending["a"]; ok {
+		t.Error("a changed revision left the read, and its resolve, in place")
 	}
 }
 
@@ -136,8 +138,10 @@ func TestApplyRevisionsDropsCacheWhenRevisionMoves(t *testing.T) {
 // one must not be read as "changed" and throw away a good cache every listing.
 func TestApplyRevisionsIgnoresEntriesWithoutOne(t *testing.T) {
 	p := &SpotifyProvider{
-		trackCache:  map[string]*playlistCache{"a": {revision: "01", tracks: []playlist.Track{{Path: "spotify:track:x"}}}},
-		contextURIs: map[string][]string{},
+		trackCache:       map[string]*playlistCache{"a": {revision: "01", tracks: []playlist.Track{{Path: "spotify:track:x"}}}},
+		pending:          map[string]*pendingTracks{},
+		declinedByWeb:    map[string]bool{},
+		declinedByClient: map[string]bool{},
 	}
 	p.applyRevisions([]rootlistEntry{revEntry("a", nil)})
 	if c := p.trackCache["a"]; c == nil || len(c.tracks) != 1 {
@@ -149,8 +153,10 @@ func TestApplyRevisionsIgnoresEntriesWithoutOne(t *testing.T) {
 // rootlist revision: they version the same playlist in different id spaces.
 func TestApplyRevisionsDoesNotCollideWithSnapshotIDs(t *testing.T) {
 	p := &SpotifyProvider{
-		trackCache:  map[string]*playlistCache{},
-		contextURIs: map[string][]string{},
+		trackCache:       map[string]*playlistCache{},
+		pending:          map[string]*pendingTracks{},
+		declinedByWeb:    map[string]bool{},
+		declinedByClient: map[string]bool{},
 	}
 	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{0xAB})})
 	if got := p.trackCache["a"].snapshotID; got != "" {
@@ -169,7 +175,6 @@ func TestApplyRevisionsDoesNotCollideWithSnapshotIDs(t *testing.T) {
 func TestApplyRevisionsDiscardsAnInFlightRead(t *testing.T) {
 	p := &SpotifyProvider{
 		trackCache:       map[string]*playlistCache{},
-		contextURIs:      map[string][]string{},
 		pending:          map[string]*pendingTracks{},
 		declinedByWeb:    map[string]bool{},
 		declinedByClient: map[string]bool{},
@@ -178,15 +183,15 @@ func TestApplyRevisionsDiscardsAnInFlightRead(t *testing.T) {
 
 	// A chain is midway through reading the list.
 	p.pending["a"] = &pendingTracks{total: 10, want: 5, tracks: make([]playlist.Track, 5)}
-	p.contextURIs["a"] = []string{"spotify:track:x"}
+	p.pending["a"] = &pendingTracks{want: 1, total: 1, uris: []string{"spotify:track:x"}}
 
 	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{2})})
 
 	if p.pending["a"] != nil {
 		t.Error("the accumulation survived a revision change, so the next page would splice two snapshots")
 	}
-	if _, ok := p.contextURIs["a"]; ok {
-		t.Error("the resolve survived a revision change")
+	if _, ok := p.pending["a"]; ok {
+		t.Error("the read, and the resolve it holds, survived a revision change")
 	}
 }
 

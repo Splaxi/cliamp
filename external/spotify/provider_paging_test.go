@@ -559,24 +559,32 @@ func TestTracksPageReresolvesBeforeProvingAResume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Stand in for the resolve the abandoned chain was reading from.
+	// Stand in for the resolve the abandoned chain was reading from, and watch
+	// what page zero is handed.
 	p.mu.Lock()
-	if p.pending["YOUR MUSIC"] == nil {
+	pend := p.pending["YOUR MUSIC"]
+	if pend == nil {
 		p.mu.Unlock()
 		t.Fatal("no accumulation to resume; the test no longer covers its case")
 	}
-	p.contextURIs["YOUR MUSIC"] = []string{"spotify:track:stale"}
+	pend.uris = []string{"spotify:track:stale"}
 	p.mu.Unlock()
+
+	var carried [][]string
+	real := p.clientPage
+	p.clientPage = func(ctx context.Context, id string, off int, uris []string) (tracksPage, error) {
+		carried = append(carried, uris)
+		return real(ctx, id, off, uris)
+	}
 
 	if _, _, err := p.TracksPage("YOUR MUSIC", 0); err != nil {
 		t.Fatal(err)
 	}
 
-	p.mu.Lock()
-	_, kept := p.contextURIs["YOUR MUSIC"]
-	p.mu.Unlock()
-	if kept {
-		t.Error("resume kept the cached resolve, so it validated against the snapshot it started from")
+	for _, u := range carried {
+		if u != nil {
+			t.Error("page zero was handed the abandoned read's resolve, so the proof compares that snapshot with itself")
+		}
 	}
 }
 
@@ -589,9 +597,9 @@ func TestTracksPageStopsRetryingADecliningClientPath(t *testing.T) {
 
 	attempts := 0
 	real := p.clientPage
-	p.clientPage = func(ctx context.Context, id string, off int) ([]playlist.Track, int, int, error) {
+	p.clientPage = func(ctx context.Context, id string, off int, uris []string) (tracksPage, error) {
 		attempts++
-		return real(ctx, id, off)
+		return real(ctx, id, off, uris)
 	}
 
 	// No librespot session, so every client attempt fails and the Web API serves.
@@ -623,9 +631,9 @@ func TestTracksPageForgetsADeclineFromAnAbandonedRead(t *testing.T) {
 
 	attempts := 0
 	real := p.clientPage
-	p.clientPage = func(ctx context.Context, id string, off int) ([]playlist.Track, int, int, error) {
+	p.clientPage = func(ctx context.Context, id string, off int, uris []string) (tracksPage, error) {
 		attempts++
-		return real(ctx, id, off)
+		return real(ctx, id, off, uris)
 	}
 
 	// Read page zero, then walk away without finishing the list.
@@ -676,9 +684,9 @@ func TestTracksForgetsADeclineFromAnAbandonedRead(t *testing.T) {
 
 	attempts := 0
 	real := p.clientPage
-	p.clientPage = func(ctx context.Context, id string, off int) ([]playlist.Track, int, int, error) {
+	p.clientPage = func(ctx context.Context, id string, off int, uris []string) (tracksPage, error) {
 		attempts++
-		return real(ctx, id, off)
+		return real(ctx, id, off, uris)
 	}
 
 	// Abandon a paged read after page zero declines the client path.
@@ -704,9 +712,10 @@ func TestTracksForgetsADeclineFromAnAbandonedRead(t *testing.T) {
 // designed failure direction.
 func TestSavedTracksCheckLeavesALiveChainAlone(t *testing.T) {
 	p := &SpotifyProvider{
-		trackCache:  map[string]*playlistCache{},
-		pending:     map[string]*pendingTracks{"YOUR MUSIC": {total: 1, want: 1}},
-		contextURIs: map[string][]string{"YOUR MUSIC": {"spotify:track:a"}},
+		trackCache: map[string]*playlistCache{},
+		pending: map[string]*pendingTracks{"YOUR MUSIC": {
+			total: 1, want: 1, uris: []string{"spotify:track:a"},
+		}},
 	}
 
 	unchanged, err := p.savedTracksUnchangedClient(context.Background(), []playlist.Track{{Path: "spotify:track:a"}}, 1)
@@ -716,23 +725,26 @@ func TestSavedTracksCheckLeavesALiveChainAlone(t *testing.T) {
 	if unchanged {
 		t.Error("a live chain cannot prove the cache current, so the check must ask for a re-read")
 	}
-	if _, ok := p.contextURIs["YOUR MUSIC"]; !ok {
-		t.Error("the check deleted a live chain's resolve, so its next page splices two snapshots")
+	if pend := p.pending["YOUR MUSIC"]; pend == nil || len(pend.uris) != 1 {
+		t.Error("the check disturbed a live read's resolve")
 	}
 }
 
 // seedResolve stands in for a client-served read having resolved the list.
 func seedResolve(p *SpotifyProvider, playlistID string) {
 	p.mu.Lock()
-	p.contextURIs[playlistID] = []string{"spotify:track:a", "spotify:track:b"}
+	if pend := p.pending[playlistID]; pend != nil {
+		pend.uris = []string{"spotify:track:a", "spotify:track:b"}
+	}
 	p.mu.Unlock()
 }
 
+// resolveHeld reports whether any read still holds a resolve for this list.
 func resolveHeld(p *SpotifyProvider, playlistID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	_, ok := p.contextURIs[playlistID]
-	return ok
+	pend := p.pending[playlistID]
+	return pend != nil && pend.uris != nil
 }
 
 // However a read ends, the snapshot it resolved must end with it. A resolve
@@ -809,9 +821,9 @@ func TestOrdinaryPlaylistsStillLeadWithTheWebAPI(t *testing.T) {
 
 	attempts := 0
 	real := p.clientPage
-	p.clientPage = func(ctx context.Context, id string, off int) ([]playlist.Track, int, int, error) {
+	p.clientPage = func(ctx context.Context, id string, off int, uris []string) (tracksPage, error) {
 		attempts++
-		return real(ctx, id, off)
+		return real(ctx, id, off, uris)
 	}
 
 	if _, _, err := p.TracksPage("somelist", 0); err != nil {
@@ -822,5 +834,62 @@ func TestOrdinaryPlaylistsStillLeadWithTheWebAPI(t *testing.T) {
 	}
 	if calls == 0 {
 		t.Error("the Web API was never asked")
+	}
+}
+
+// A read slices every page from the snapshot it started with. Before the
+// resolve belonged to the read, it sat in a map keyed by playlist, so a second
+// reader of the same list -- reachable in daemon mode, where each IPC
+// connection gets its own goroutine -- would overwrite or delete it, and the
+// first read would finish by slicing somebody else's snapshot. A same-total
+// edit in that window commits a list short by one and duplicated by one, which
+// nothing afterwards can detect.
+func TestConcurrentReadsDoNotShareAResolve(t *testing.T) {
+	calls := 0
+	p := savedTracksProvider(t, 200, &calls)
+
+	// Two reads, each with its own resolve, distinguishable by content.
+	first := []string{"spotify:track:first"}
+	second := []string{"spotify:track:second"}
+
+	var served [][]string
+	p.clientPage = func(_ context.Context, _ string, offset int, uris []string) (tracksPage, error) {
+		served = append(served, uris)
+		if uris == nil {
+			uris = first
+		}
+		return tracksPage{
+			tracks:   []playlist.Track{{Path: uris[0]}},
+			total:    2,
+			pageSize: 1,
+			uris:     uris,
+		}, nil
+	}
+	p.apiMode = apiModeClient
+
+	// Read one takes page zero and is left mid-flight.
+	if _, next, err := p.TracksPage("YOUR MUSIC", 0); err != nil || next != 1 {
+		t.Fatalf("read one page zero: next=%d err=%v", next, err)
+	}
+	p.mu.Lock()
+	pend := p.pending["YOUR MUSIC"]
+	if pend == nil {
+		p.mu.Unlock()
+		t.Fatal("read one left no accumulation")
+	}
+	pend.uris = second // a second reader's snapshot, were it able to reach in
+	p.mu.Unlock()
+
+	// Read one's continuation must slice what IT is holding, whatever that is,
+	// rather than a snapshot handed to it by a map shared with other readers.
+	served = nil
+	if _, _, err := p.TracksPage("YOUR MUSIC", 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(served) != 1 {
+		t.Fatalf("continuation made %d client calls, want 1", len(served))
+	}
+	if len(served[0]) == 0 || served[0][0] != "spotify:track:second" {
+		t.Errorf("continuation sliced %v, want the resolve its own accumulation holds", served[0])
 	}
 }

@@ -65,6 +65,22 @@ type pendingTracks struct {
 	want     int
 	total    int
 	snapshot string // playlist snapshot_id the accumulation began under; "" for saved tracks
+	// uris is the resolve this read is slicing, when the client protocol is
+	// serving it. It lives here rather than in a map keyed by playlist so that
+	// it cannot outlive the read or be taken by another one: a page sliced from
+	// somebody else's snapshot is how a list ends up short by one and
+	// duplicated by one, with nothing able to tell afterwards.
+	uris []string
+}
+
+// tracksPage is one page of a read, plus the resolve it came from when the
+// client protocol served it. The Web API pages the list itself and leaves uris
+// nil.
+type tracksPage struct {
+	tracks   []playlist.Track
+	total    int
+	pageSize int
+	uris     []string
 }
 
 type SpotifyProvider struct {
@@ -76,14 +92,13 @@ type SpotifyProvider struct {
 	mu               sync.Mutex
 	trackCache       map[string]*playlistCache // playlist ID → cache entry
 	pending          map[string]*pendingTracks
-	contextURIs      map[string][]string // playlist ID -> ordered track URIs, from spclient
-	declinedByWeb    map[string]bool     // playlist ID -> the web api refused it this read
-	declinedByClient map[string]bool     // playlist ID -> the client protocol refused it this read
-	apiMode          apiMode             // which read path to prefer; see CLIAMP_SPOTIFY_API
+	declinedByWeb    map[string]bool // playlist ID -> the web api refused it this read
+	declinedByClient map[string]bool // playlist ID -> the client protocol refused it this read
+	apiMode          apiMode         // which read path to prefer; see CLIAMP_SPOTIFY_API
 	// clientPage is the client-protocol read, indirected so tests can count the
 	// attempts the decline flags exist to prevent: a failed attempt is
 	// otherwise indistinguishable from one that never happened. Always set.
-	clientPage func(context.Context, string, int) ([]playlist.Track, int, int, error)
+	clientPage func(context.Context, string, int, []string) (tracksPage, error)
 	authCancel context.CancelFunc // cancels any in-progress OAuth flow
 
 	// Playlist list cache to avoid redundant API calls on provider switch.
@@ -117,7 +132,6 @@ func New(session *Session, clientID string, bitrate int) *SpotifyProvider {
 		bitrate:          bitrate,
 		trackCache:       make(map[string]*playlistCache),
 		pending:          make(map[string]*pendingTracks),
-		contextURIs:      make(map[string][]string),
 		declinedByWeb:    make(map[string]bool),
 		declinedByClient: make(map[string]bool),
 		apiMode:          resolveAPIMode(),
@@ -501,28 +515,32 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 	// so a library being actively edited cannot loop forever.
 	const maxRestarts = 2
 	var all []playlist.Track
+	// uris is this read's own resolve, carried between its pages so every one
+	// is sliced from the same snapshot. A restart drops it and takes a new one.
+	var uris []string
 	total, offset, restarts := -1, 0, 0
 	for {
-		page, pageTotal, pageSize, err := p.fetchTracksPage(ctx, playlistID, offset)
+		page, err := p.fetchTracksPage(ctx, playlistID, offset, uris)
 		if err != nil {
 			return nil, err
 		}
+		uris = page.uris
 		if total < 0 {
-			total = pageTotal
+			total = page.total
 		}
-		if pageTotal != total {
+		if page.total != total {
 			if restarts == maxRestarts {
 				return nil, fmt.Errorf("spotify: list tracks: %q changed while loading", playlistID)
 			}
 			restarts++
-			all, total, offset = nil, -1, 0
+			all, uris, total, offset = nil, nil, -1, 0
 			continue
 		}
-		all = append(all, page...)
-		if offset+pageSize >= total {
+		all = append(all, page.tracks...)
+		if offset+page.pageSize >= total {
 			break
 		}
-		offset += pageSize
+		offset += page.pageSize
 	}
 
 	// Cache the fetched tracks.
@@ -538,7 +556,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 // the user's own playlists there, so the common case stays on the documented
 // path; a playlist owned by someone else, or a Spotify-owned mix, comes back
 // 403 and is readable only through the client protocol.
-func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, int, error) {
+func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string, offset int, uris []string) (tracksPage, error) {
 	fallback := p.apiMode.usesClient()
 
 	// Once the Web API has refused this list, every later page of the same read
@@ -546,7 +564,7 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 	// a large library -- and hammering an API that is rate limiting is how a
 	// cooldown gets extended.
 	if fallback && (p.apiMode.skipsWeb() || p.webDeclined(playlistID)) {
-		return p.clientPage(ctx, playlistID, offset)
+		return p.clientPage(ctx, playlistID, offset, uris)
 	}
 
 	// Liked Songs leads with the client protocol. The Web API does not refuse
@@ -556,9 +574,9 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 	// The list cannot lose anything in the move: Spotify keeps saved episodes
 	// in a separate collection, so this one holds nothing but tracks.
 	if fallback && playlistID == savedTracksPlaylistID && !p.clientDeclined(playlistID) {
-		tracks, total, size, err := p.clientPage(ctx, playlistID, offset)
+		page, err := p.clientPage(ctx, playlistID, offset, uris)
 		if err == nil {
-			return tracks, total, size, nil
+			return page, nil
 		}
 		p.noteClientDeclined(playlistID)
 		applog.Warn("spotify: client protocol declined saved tracks (%v), trying the web api", err)
@@ -576,11 +594,12 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 
 	tracks, total, err := p.webTracksPage(webCtx, playlistID, offset)
 	if err == nil {
-		// The Web API pages the list itself and caps a page at fifty.
-		return tracks, total, spotifyTrackPageSize, nil
+		// The Web API pages the list itself and caps a page at fifty, and
+		// leaves the read nothing to carry between pages.
+		return tracksPage{tracks: tracks, total: total, pageSize: spotifyTrackPageSize}, nil
 	}
 	if !fallback {
-		return nil, 0, 0, err
+		return tracksPage{}, err
 	}
 	// Pages read before and after this switch are spliced into one list, so the
 	// two paths must enumerate a playlist in the same order. Both are
@@ -590,14 +609,14 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 	// would commit a list spliced from two orderings.
 	applog.Warn("spotify: web api declined %q (%v), trying the client protocol", playlistID, err)
 	p.noteWebDeclined(playlistID)
-	tracks, total, size, cerr := p.clientPage(ctx, playlistID, offset)
+	page, cerr := p.clientPage(ctx, playlistID, offset, uris)
 	if cerr != nil {
 		// Report the Web API's refusal: it is the documented path and its error
 		// says why the playlist is unreadable.
 		applog.Warn("spotify: client protocol also failed for %q: %v", playlistID, cerr)
-		return nil, 0, 0, err
+		return tracksPage{}, err
 	}
-	return tracks, total, size, nil
+	return page, nil
 }
 
 // webTracksPage reads one page of a playlist's tracks through the Web API and
@@ -764,9 +783,7 @@ func (p *SpotifyProvider) noteClientDeclined(playlistID string) {
 // the same stale list. p.mu must be held.
 func (p *SpotifyProvider) discardLoadLocked(playlistID string) {
 	delete(p.pending, playlistID)
-	delete(p.contextURIs, playlistID)
-	delete(p.declinedByWeb, playlistID)
-	delete(p.declinedByClient, playlistID)
+	p.clearDeclinesLocked(playlistID)
 }
 
 // cachedTracksLocked returns a copy of the committed list and its total, if
@@ -801,26 +818,18 @@ func (p *SpotifyProvider) cacheTracksLocked(playlistID string, tracks []playlist
 // The resolve is taken fresh and then dropped: a stored one would outlive the
 // check and could serve a later read from a snapshot nothing revalidated.
 func (p *SpotifyProvider) savedTracksUnchangedClient(ctx context.Context, tracks []playlist.Track, total int) (bool, error) {
-	// A read already paging this list is slicing the stored resolve. Taking it
-	// away would make that read's next page re-resolve and splice two snapshots
-	// into one list, so leave a live chain alone and let the check fail into a
-	// re-read instead.
+	// A read already paging this list is about to replace the cached one, so
+	// proving the cache current would spend a resolve on an answer nobody will
+	// use. Report unproven and let that read finish.
 	p.mu.Lock()
 	live := p.pending[savedTracksPlaylistID] != nil
-	if !live {
-		delete(p.contextURIs, savedTracksPlaylistID)
-	}
 	p.mu.Unlock()
 	if live {
 		return false, nil
 	}
 
+	// This resolve belongs to the check alone and goes out of scope with it.
 	uris, err := p.contextTrackURIs(ctx, savedTracksPlaylistID)
-
-	p.mu.Lock()
-	delete(p.contextURIs, savedTracksPlaylistID)
-	p.mu.Unlock()
-
 	if err != nil {
 		return false, err
 	}
@@ -902,28 +911,35 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 	if hit && (playlistID != savedTracksPlaylistID || p.savedTracksCurrent(ctx, tracks, cachedTotal)) {
 		return tracks, 0, nil
 	}
-	// A resume is proved by comparing the page just fetched against the
-	// accumulation. On the client path both would come from the URI list
-	// resolved when that accumulation began, so the proof would be the stale
-	// snapshot agreeing with itself. Drop the resolve so this page describes
-	// the library now; for Web-served reads there is nothing cached to drop.
+	// Page zero takes a fresh resolve rather than the abandoned read's, so a
+	// resume is proved against the library now rather than against the snapshot
+	// that read left behind, agreeing with itself.
 	if offset == 0 {
 		p.mu.Lock()
-		if p.pending[playlistID] != nil {
-			delete(p.contextURIs, playlistID)
-		}
 		p.clearDeclinesLocked(playlistID)
 		p.mu.Unlock()
 	}
 
-	page, total, pageSize, err := p.fetchTracksPage(ctx, playlistID, offset)
+	// A continuation slices the resolve its own read started from. Page zero
+	// passes none, so it takes a fresh one.
+	var carried []string
+	if offset > 0 {
+		p.mu.Lock()
+		if pend := p.pending[playlistID]; pend != nil && pend.want == offset {
+			carried = pend.uris
+		}
+		p.mu.Unlock()
+	}
+
+	result, err := p.fetchTracksPage(ctx, playlistID, offset, carried)
 	if err != nil {
 		return nil, 0, err
 	}
+	page, total := result.tracks, result.total
 
 	// Page size follows whichever path served this page: the Web API pages the
 	// list and caps at fifty, the client protocol batches metadata instead.
-	next := offset + pageSize
+	next := offset + result.pageSize
 	if next >= total {
 		next = 0
 	}
@@ -961,9 +977,13 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 		// rather than refetching every page already paid for, at the cost of one
 		// request to prove nothing moved in between.
 		if resumable && pend != nil {
+			// The fresh resolve just proved equal to the accumulation at total
+			// and head, so the remaining pages come from it rather than from
+			// the one the abandoned read was holding.
+			pend.uris = result.uris
 			return slices.Clone(pend.tracks), pend.want, nil
 		}
-		pend = &pendingTracks{total: total, snapshot: p.snapshotIDLocked(playlistID)}
+		pend = &pendingTracks{total: total, snapshot: p.snapshotIDLocked(playlistID), uris: result.uris}
 		p.pending[playlistID] = pend
 	}
 	// A page at an offset this accumulation is not waiting for belongs to a
@@ -1411,7 +1431,7 @@ func (p *SpotifyProvider) AddTrackToPlaylist(ctx context.Context, playlistID str
 	// Invalidate caches for this playlist.
 	p.mu.Lock()
 	delete(p.trackCache, playlistID)
-	delete(p.contextURIs, playlistID)
+	p.discardLoadLocked(playlistID)
 	p.listCache = nil
 	p.mu.Unlock()
 

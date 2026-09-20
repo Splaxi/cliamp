@@ -94,7 +94,7 @@ func TestWebAPIIsAskedOncePerRead(t *testing.T) {
 	p := New(sess, "client", 320)
 
 	for offset := 0; offset < 300; offset += spotifyTrackPageSize {
-		_, _, _, _ = p.fetchTracksPage(t.Context(), "somelist", offset)
+		_, _ = p.fetchTracksPage(t.Context(), "somelist", offset, nil)
 	}
 	if webCalls > 1 {
 		t.Errorf("asked the web api %d times for one read; it refused on the first", webCalls)

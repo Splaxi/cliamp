@@ -33,26 +33,28 @@ func stubAddTrack(t *testing.T, calls *int) *SpotifyProvider {
 // The resolved URI list is a snapshot of the playlist taken when a read began.
 // Keeping it past the read would serve an edited playlist from stale contents,
 // and the snapshot pin could not tell, because the length it compares comes
-// from that same stale list.
+// from that same stale list. It now lives inside the accumulation, so ending
+// the read is what disposes of it.
 func TestResolvedURIsDoNotOutliveTheRead(t *testing.T) {
 	p := &SpotifyProvider{
-		trackCache:  map[string]*playlistCache{},
-		pending:     map[string]*pendingTracks{},
-		contextURIs: map[string][]string{},
+		trackCache:       map[string]*playlistCache{},
+		pending:          map[string]*pendingTracks{},
+		declinedByWeb:    map[string]bool{},
+		declinedByClient: map[string]bool{},
 	}
 
 	for _, name := range []string{"committed", "discarded"} {
 		t.Run(name, func(t *testing.T) {
-			p.pending["list"] = &pendingTracks{want: 50, total: 100}
-			p.contextURIs["list"] = []string{"spotify:track:a", "spotify:track:b"}
+			p.pending["list"] = &pendingTracks{
+				want:  50,
+				total: 100,
+				uris:  []string{"spotify:track:a", "spotify:track:b"},
+			}
 
 			p.discardLoadLocked("list")
 
-			if _, ok := p.contextURIs["list"]; ok {
-				t.Error("resolved URIs survived the read; a later reopen would serve stale contents")
-			}
-			if _, ok := p.pending["list"]; ok {
-				t.Error("partial accumulation survived the read")
+			if pend, ok := p.pending["list"]; ok {
+				t.Errorf("the accumulation survived the read, still holding %d resolved URIs", len(pend.uris))
 			}
 		})
 	}
@@ -66,7 +68,7 @@ func TestInvalidationDropsResolvedURIs(t *testing.T) {
 	p := stubAddTrack(t, &calls)
 	p.mu.Lock()
 	p.trackCache["list"] = &playlistCache{snapshotID: "old", tracks: []playlist.Track{{Path: "spotify:track:a"}}}
-	p.contextURIs["list"] = []string{"spotify:track:a"}
+	p.pending["list"] = &pendingTracks{want: 50, total: 100, uris: []string{"spotify:track:a"}}
 	p.mu.Unlock()
 
 	if err := p.AddTrackToPlaylist(context.Background(), "list", playlist.Track{Path: "spotify:track:b"}); err != nil {
@@ -75,8 +77,8 @@ func TestInvalidationDropsResolvedURIs(t *testing.T) {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	if _, ok := p.contextURIs["list"]; ok {
-		t.Error("resolved URIs outlived a write to the playlist")
+	if _, ok := p.pending["list"]; ok {
+		t.Error("an in-flight read, and the resolve it holds, outlived a write to the playlist")
 	}
 	if _, ok := p.trackCache["list"]; ok {
 		t.Error("cached tracks outlived a write to the playlist")

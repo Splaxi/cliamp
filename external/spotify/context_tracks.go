@@ -18,16 +18,12 @@ import (
 // refuses -- another user's list, or a Spotify-owned mix -- and it is not
 // subject to the Web API's quota.
 
-// contextTrackURIs returns every track URI in a playlist, in order, caching the
-// result so paging through it costs one request rather than one per page.
+// contextTrackURIs resolves every track URI in a playlist, in order. The result
+// is not cached anywhere shared: it is a snapshot of the playlist at this
+// instant, and the read that asked for it owns it for as long as that read
+// lasts. Two reads of the same list each get their own, so neither can slice
+// the other's.
 func (p *SpotifyProvider) contextTrackURIs(ctx context.Context, playlistID string) ([]string, error) {
-	p.mu.Lock()
-	if uris, ok := p.contextURIs[playlistID]; ok {
-		p.mu.Unlock()
-		return uris, nil
-	}
-	p.mu.Unlock()
-
 	sess := p.session
 	if sess == nil || sess.sess == nil {
 		return nil, fmt.Errorf("spotify: context resolve: no session")
@@ -38,7 +34,7 @@ func (p *SpotifyProvider) contextTrackURIs(ctx context.Context, playlistID strin
 	}
 
 	// A resolve answers with every track inline: probed against this account's
-	// largest lists, a 6077-track collection and a 1693-track playlist each came
+	// largest lists, a 6078-track collection and a 1693-track playlist each came
 	// back as one page with no continuation. The page type can carry one
 	// (next_page_url), though, and because the list length below becomes the
 	// total, a truncated resolve would look like a short list rather than an
@@ -56,10 +52,6 @@ func (p *SpotifyProvider) contextTrackURIs(ctx context.Context, playlistID strin
 			}
 		}
 	}
-
-	p.mu.Lock()
-	p.contextURIs[playlistID] = uris
-	p.mu.Unlock()
 	return uris, nil
 }
 
@@ -149,25 +141,30 @@ func trackFromMetadata(uri string, tr *metadatapb.Track) playlist.Track {
 	}
 }
 
-// contextTracksPage serves one page of a playlist through the client protocol,
-// returning the page, the playlist's total length, and the page size it used.
-// That size is not the Web API's: this path resolves the whole list up front
-// and then batches metadata, so a page is one metadata request rather than one
-// list request, and is sized to match.
-func (p *SpotifyProvider) contextTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, int, error) {
-	uris, err := p.contextTrackURIs(ctx, playlistID)
-	if err != nil {
-		return nil, 0, 0, err
+// contextTracksPage serves one page of a playlist through the client protocol.
+// The caller passes the resolve its read is working from, or nil to take a
+// fresh one, which is then returned so the read can keep it for its remaining
+// pages. The page size is not the Web API's: this path resolves the whole list
+// up front and then batches metadata, so a page is one metadata request rather
+// than one list request, and is sized to match.
+func (p *SpotifyProvider) contextTracksPage(ctx context.Context, playlistID string, offset int, uris []string) (tracksPage, error) {
+	if uris == nil {
+		var err error
+		if uris, err = p.contextTrackURIs(ctx, playlistID); err != nil {
+			return tracksPage{}, err
+		}
 	}
+	page := tracksPage{total: len(uris), pageSize: spotifyMetadataBatch, uris: uris}
 	if offset >= len(uris) {
-		return nil, len(uris), spotifyMetadataBatch, nil
+		return page, nil
 	}
 	end := min(offset+spotifyMetadataBatch, len(uris))
 	tracks, err := p.trackMetadata(ctx, uris[offset:end])
 	if err != nil {
-		return nil, 0, 0, err
+		return tracksPage{}, err
 	}
-	return tracks, len(uris), spotifyMetadataBatch, nil
+	page.tracks = tracks
+	return page, nil
 }
 
 // TrackRadio builds the station Spotify generates from a track -- what its own
