@@ -83,11 +83,13 @@ func TestRootlistPlaylistsIgnoresMismatchedEndGroup(t *testing.T) {
 		{URI: "spotify:playlist:a", Name: "Nested", TrackCount: 1, Owner: "listener"},
 		{URI: "spotify:end-group:f1", FolderID: "f1"}, // closes the outer one out of order
 		{URI: "spotify:playlist:b", Name: "After", TrackCount: 1, Owner: "listener"},
+		// A reference Spotify no longer serves: unnamed, and 404s when opened.
+		{URI: "spotify:playlist:gone", TrackCount: 2, Owner: "listener"},
 	}
 	p := &SpotifyProvider{}
 	got := p.rootlistPlaylists(entries, "listener")
 	if len(got) != 2 {
-		t.Fatalf("got %d playlists, want 2", len(got))
+		t.Fatalf("got %d playlists, want 2 (the unopenable entry must be hidden)", len(got))
 	}
 	if got[0].Section != "Outer / Inner" {
 		t.Errorf("nested playlist section = %q, want %q", got[0].Section, "Outer / Inner")
