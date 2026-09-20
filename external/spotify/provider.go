@@ -66,18 +66,19 @@ type pendingTracks struct {
 }
 
 type SpotifyProvider struct {
-	session       *Session
-	clientID      string
-	bitrate       int
-	userID        string // Spotify user ID, fetched lazily on first Playlists() call
-	meFetched     bool   // /v1/me has been attempted this session; suppresses retry on failure
-	mu            sync.Mutex
-	trackCache    map[string]*playlistCache // playlist ID → cache entry
-	pending       map[string]*pendingTracks
-	contextURIs   map[string][]string // playlist ID -> ordered track URIs, from spclient
-	declinedByWeb map[string]bool     // playlist ID -> the web api refused it this read
-	apiMode       apiMode             // which read path to prefer; see CLIAMP_SPOTIFY_API
-	authCancel    context.CancelFunc  // cancels any in-progress OAuth flow
+	session          *Session
+	clientID         string
+	bitrate          int
+	userID           string // Spotify user ID, fetched lazily on first Playlists() call
+	meFetched        bool   // /v1/me has been attempted this session; suppresses retry on failure
+	mu               sync.Mutex
+	trackCache       map[string]*playlistCache // playlist ID → cache entry
+	pending          map[string]*pendingTracks
+	contextURIs      map[string][]string // playlist ID -> ordered track URIs, from spclient
+	declinedByWeb    map[string]bool     // playlist ID -> the web api refused it this read
+	declinedByClient map[string]bool     // playlist ID -> the client protocol refused it this read
+	apiMode          apiMode             // which read path to prefer; see CLIAMP_SPOTIFY_API
+	authCancel       context.CancelFunc  // cancels any in-progress OAuth flow
 
 	// Playlist list cache to avoid redundant API calls on provider switch.
 	listCache   []playlist.PlaylistInfo
@@ -97,14 +98,15 @@ const webTracksAttemptBudget = 6 * time.Second
 // bitrate sets the preferred Spotify stream quality in kbps (96, 160, or 320).
 func New(session *Session, clientID string, bitrate int) *SpotifyProvider {
 	return &SpotifyProvider{
-		session:       session,
-		clientID:      clientID,
-		bitrate:       bitrate,
-		trackCache:    make(map[string]*playlistCache),
-		pending:       make(map[string]*pendingTracks),
-		contextURIs:   make(map[string][]string),
-		declinedByWeb: make(map[string]bool),
-		apiMode:       resolveAPIMode(),
+		session:          session,
+		clientID:         clientID,
+		bitrate:          bitrate,
+		trackCache:       make(map[string]*playlistCache),
+		pending:          make(map[string]*pendingTracks),
+		contextURIs:      make(map[string][]string),
+		declinedByWeb:    make(map[string]bool),
+		declinedByClient: make(map[string]bool),
+		apiMode:          resolveAPIMode(),
 	}
 }
 
@@ -522,6 +524,21 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 		return p.contextTracksPage(ctx, playlistID, offset)
 	}
 
+	// Liked Songs leads with the client protocol. The Web API does not refuse
+	// it, so the fallback below would never reach it -- but it pages the list
+	// fifty at a time, and a library of a few thousand tracks is the request
+	// volume that earns a day-long throttle. One resolve replaces all of it.
+	// The list cannot lose anything in the move: Spotify keeps saved episodes
+	// in a separate collection, so this one holds nothing but tracks.
+	if fallback && playlistID == savedTracksPlaylistID && !p.clientDeclined(playlistID) {
+		tracks, total, size, err := p.contextTracksPage(ctx, playlistID, offset)
+		if err == nil {
+			return tracks, total, size, nil
+		}
+		p.noteClientDeclined(playlistID)
+		applog.Warn("spotify: client protocol declined saved tracks (%v), trying the web api", err)
+	}
+
 	webCtx := ctx
 	if fallback {
 		// A refusal comes back at once, but a throttled Web API can sit in its
@@ -657,6 +674,22 @@ func (p *SpotifyProvider) noteWebDeclined(playlistID string) {
 	p.declinedByWeb[playlistID] = true
 }
 
+// clientDeclined and noteClientDeclined are the mirror of the two above, for
+// the lists the client protocol leads. Without them a failing resolve would be
+// retried once per page on the way to the Web API, which is the cost the Web
+// API's own stickiness exists to avoid.
+func (p *SpotifyProvider) clientDeclined(playlistID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.declinedByClient[playlistID]
+}
+
+func (p *SpotifyProvider) noteClientDeclined(playlistID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.declinedByClient[playlistID] = true
+}
+
 // discardLoadLocked drops everything scoped to one read of a playlist: the
 // partial accumulation, and the resolved track URIs behind it. The URI list is
 // a snapshot of the playlist taken when the read began, so it must not outlive
@@ -667,6 +700,7 @@ func (p *SpotifyProvider) discardLoadLocked(playlistID string) {
 	delete(p.pending, playlistID)
 	delete(p.contextURIs, playlistID)
 	delete(p.declinedByWeb, playlistID)
+	delete(p.declinedByClient, playlistID)
 }
 
 // cachedTracksLocked returns a copy of the committed list and its total, if

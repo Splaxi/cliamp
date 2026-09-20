@@ -92,14 +92,14 @@ Podcast episodes work as tracks. Press `Ctrl+F` to search Spotify. Matching epis
 
 Cliamp reads Spotify two ways. The Web API is the documented one and serves most things. The client protocol is the one Cliamp already speaks to play audio, and it reaches what the Web API will not: playlist folders, saved radios, Spotify's own mixes, and playlists owned by someone else, all of which a Development Mode app is refused.
 
-By default the Web API is tried first and the client protocol only picks up what it declines, so ordinary use is unchanged. The library listing is the exception: there the Web API does not fail, it simply answers with less, so the client protocol leads and the Web API is the fallback.
+By default the Web API is tried first and the client protocol only picks up what it declines, so ordinary use is unchanged. Two reads are the exception, both because the Web API does not fail there and so a fallback could never reach them: the library listing, which it answers with less (no folders, and none of the playlists it will not serve), and Liked Songs, which it serves fifty tracks per request. A library of several thousand tracks is over a hundred requests that way, which is how a day-long throttle is earned, so the client protocol leads and the Web API is the fallback.
 
 Set `CLIAMP_SPOTIFY_API` to change this:
 
 | Value | Behaviour |
 |---|---|
 | `auto` | Default. Web API first, client protocol for what it refuses. |
-| `client` | Client protocol only. Useful when the Web API is rate limiting, and it makes a broken internal endpoint visible rather than silently masked. |
+| `client` | Never fall back to the Web API for a read the client protocol can serve, so a broken internal endpoint surfaces instead of being masked. Saved albums, album tracks, search and the Liked Songs count have no client-protocol equivalent and still use the Web API in this mode. |
 | `web` | Web API only. Cliamp's behaviour before the client protocol was added; folders, saved radios and other people's playlists are unavailable. |
 
 Track counts beside folder-grouped playlists come from Spotify's own library listing and are a cached figure, so one can sit a track or two off what the playlist actually holds. The list itself is always read fresh.

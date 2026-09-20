@@ -577,3 +577,36 @@ func TestTracksPageReresolvesBeforeProvingAResume(t *testing.T) {
 		t.Error("resume kept the cached resolve, so it validated against the snapshot it started from")
 	}
 }
+
+// Liked Songs leads with the client protocol, so a client path that cannot
+// serve must be noted once and not re-asked on every page of the same read --
+// the mirror of the stickiness the Web API path already has.
+func TestTracksPageStopsRetryingADecliningClientPath(t *testing.T) {
+	calls := 0
+	p := savedTracksProvider(t, 200, &calls)
+
+	// No librespot session, so every client attempt fails.
+	if _, next, err := p.TracksPage("YOUR MUSIC", 0); err != nil || next != 50 {
+		t.Fatalf("page 0: next=%d err=%v", next, err)
+	}
+	p.mu.Lock()
+	declined := p.declinedByClient["YOUR MUSIC"]
+	p.mu.Unlock()
+	if !declined {
+		t.Fatal("a failing client path was not noted, so it will be re-asked on every page")
+	}
+
+	// Drain the rest; the read must still complete over the Web API.
+	if got := drainFrom(t, p, 50) + 50; got != 200 {
+		t.Errorf("collected %d tracks, want 200", got)
+	}
+
+	// A completed read clears the decline, so a transient failure does not
+	// disable the client path for the life of the process.
+	p.mu.Lock()
+	still := p.declinedByClient["YOUR MUSIC"]
+	p.mu.Unlock()
+	if still {
+		t.Error("the decline outlived the read that recorded it")
+	}
+}
