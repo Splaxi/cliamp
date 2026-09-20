@@ -13,7 +13,6 @@ The wizard writes the required TOML block and leaves the rest of your config unc
 cliamp searches for its config directory in this order:
 
 - `CLIAMP_CONFIG_DIR`
-- `CLIAMP_SPOTIFY_API` — which API Spotify is read through: `auto` (default), `client`, or `web`. See [Spotify](spotify.md#how-cliamp-reads-your-library).
 - `XDG_CONFIG_HOME/cliamp`
 - `HOME/.config/cliamp`
 - on Windows, `%APPDATA%\cliamp` when `HOME` is not set
@@ -26,6 +25,11 @@ For other settings, copy and edit the example config:
 mkdir -p ~/.config/cliamp
 cp config.toml.example ~/.config/cliamp/config.toml
 ```
+
+## Environment variables
+
+- `CLIAMP_CONFIG_DIR` — overrides where the config directory is found, as above.
+- `CLIAMP_SPOTIFY_API` — which path Spotify is read through: `auto` (default), `client`, or `web`. See [Spotify](spotify.md#how-cliamp-reads-your-library).
 
 ## Options
 
