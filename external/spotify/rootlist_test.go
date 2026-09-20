@@ -158,3 +158,32 @@ func TestApplyRevisionsDoesNotCollideWithSnapshotIDs(t *testing.T) {
 		t.Errorf("revision = %q, want %q", got, "ab")
 	}
 }
+
+// A listing that refreshes while a playlist is being paged must discard the
+// accumulation, not just the resolve behind it. Dropping only the resolve makes
+// the next page re-resolve against the new revision, and the two snapshots are
+// then spliced into one committed list that no later check can catch when the
+// edit left the total alone.
+func TestApplyRevisionsDiscardsAnInFlightRead(t *testing.T) {
+	p := &SpotifyProvider{
+		trackCache:       map[string]*playlistCache{},
+		contextURIs:      map[string][]string{},
+		pending:          map[string]*pendingTracks{},
+		declinedByWeb:    map[string]bool{},
+		declinedByClient: map[string]bool{},
+	}
+	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{1})})
+
+	// A chain is midway through reading the list.
+	p.pending["a"] = &pendingTracks{total: 10, want: 5, tracks: make([]playlist.Track, 5)}
+	p.contextURIs["a"] = []string{"spotify:track:x"}
+
+	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{2})})
+
+	if p.pending["a"] != nil {
+		t.Error("the accumulation survived a revision change, so the next page would splice two snapshots")
+	}
+	if _, ok := p.contextURIs["a"]; ok {
+		t.Error("the resolve survived a revision change")
+	}
+}

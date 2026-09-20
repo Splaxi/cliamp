@@ -93,6 +93,12 @@ const playlistListCacheTTL = 5 * time.Minute
 // than spending the caller's whole deadline in a retry backoff.
 const webTracksAttemptBudget = 6 * time.Second
 
+// savedTracksProbeBudget bounds the check that decides whether the cached
+// Liked Songs list is still current. It is an optimisation -- failing it costs
+// a re-read, not correctness -- so it must never sit in a Web API backoff for
+// the caller's whole deadline, which is how a cooldown gets extended.
+const savedTracksProbeBudget = 4 * time.Second
+
 // New creates a SpotifyProvider. If session is nil, authentication is
 // deferred until the user first selects the Spotify provider.
 // bitrate sets the preferred Spotify stream quality in kbps (96, 160, or 320).
@@ -319,7 +325,13 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 			})
 			// Update snapshot_id in cache; if it changed, invalidate cached tracks.
 			if cached, ok := p.trackCache[item.ID]; ok {
-				if cached.snapshotID != item.SnapshotID {
+				switch {
+				case cached.snapshotID == "":
+					// Seeded by the client protocol, which versions playlists
+					// with a revision instead. Adopt the snapshot rather than
+					// read its absence as a change and throw the entry away.
+					cached.snapshotID = item.SnapshotID
+				case cached.snapshotID != item.SnapshotID:
 					delete(p.trackCache, item.ID)
 					delete(p.contextURIs, item.ID)
 				}
@@ -513,6 +525,11 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 // the user's own playlists there, so the common case stays on the documented
 // path; a playlist owned by someone else, or a Spotify-owned mix, comes back
 // 403 and is readable only through the client protocol.
+// clientTracksPage is the client-protocol read, indirected so tests can count
+// the attempts the decline flags are meant to prevent. A failed attempt is
+// otherwise indistinguishable from one that never happened.
+var clientTracksPage = (*SpotifyProvider).contextTracksPage
+
 func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, int, error) {
 	fallback := p.apiMode.usesClient()
 
@@ -521,7 +538,7 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 	// a large library -- and hammering an API that is rate limiting is how a
 	// cooldown gets extended.
 	if fallback && (p.apiMode.skipsWeb() || p.webDeclined(playlistID)) {
-		return p.contextTracksPage(ctx, playlistID, offset)
+		return clientTracksPage(p, ctx, playlistID, offset)
 	}
 
 	// Liked Songs leads with the client protocol. The Web API does not refuse
@@ -531,7 +548,7 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 	// The list cannot lose anything in the move: Spotify keeps saved episodes
 	// in a separate collection, so this one holds nothing but tracks.
 	if fallback && playlistID == savedTracksPlaylistID && !p.clientDeclined(playlistID) {
-		tracks, total, size, err := p.contextTracksPage(ctx, playlistID, offset)
+		tracks, total, size, err := clientTracksPage(p, ctx, playlistID, offset)
 		if err == nil {
 			return tracks, total, size, nil
 		}
@@ -559,7 +576,7 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 	}
 	applog.Warn("spotify: web api declined %q (%v), trying the client protocol", playlistID, err)
 	p.noteWebDeclined(playlistID)
-	tracks, total, size, cerr := p.contextTracksPage(ctx, playlistID, offset)
+	tracks, total, size, cerr := clientTracksPage(p, ctx, playlistID, offset)
 	if cerr != nil {
 		// Report the Web API's refusal: it is the documented path and its error
 		// says why the playlist is unreadable.
@@ -728,6 +745,56 @@ func (p *SpotifyProvider) cacheTracksLocked(playlistID string, tracks []playlist
 // added_at descending, so an unchanged total plus an unchanged newest entry
 // means no add or removal. If that ever stops holding the comparison simply
 // misses and we refetch, so the failure direction is stale-free.
+// savedTracksUnchangedClient answers the same question as savedTracksUnchanged
+// over the client protocol. The cached list is filled from a context resolve,
+// so proving it current with a resolve costs no Web API quota and keeps working
+// while that quota is exhausted -- which is exactly when a cache is worth most.
+// The resolve is taken fresh and then dropped: a stored one would outlive the
+// check and could serve a later read from a snapshot nothing revalidated.
+func (p *SpotifyProvider) savedTracksUnchangedClient(ctx context.Context, tracks []playlist.Track, total int) (bool, error) {
+	p.mu.Lock()
+	delete(p.contextURIs, savedTracksPlaylistID)
+	p.mu.Unlock()
+
+	uris, err := p.contextTrackURIs(ctx, savedTracksPlaylistID)
+
+	p.mu.Lock()
+	delete(p.contextURIs, savedTracksPlaylistID)
+	p.mu.Unlock()
+
+	if err != nil {
+		return false, err
+	}
+	if len(uris) != total {
+		return false, nil
+	}
+	if len(uris) == 0 {
+		return len(tracks) == 0, nil
+	}
+	return len(tracks) > 0 && uris[0] == tracks[0].Path, nil
+}
+
+// savedTracksCurrent reports whether the cached Liked Songs list still matches
+// the library, asking whichever path the mode allows. A path that cannot answer
+// is not a reason to serve a list nothing checked, so an unanswerable check
+// reads as changed and the list is re-read.
+func (p *SpotifyProvider) savedTracksCurrent(ctx context.Context, tracks []playlist.Track, total int) bool {
+	probeCtx, cancel := context.WithTimeout(ctx, savedTracksProbeBudget)
+	defer cancel()
+
+	if p.apiMode.usesClient() {
+		unchanged, err := p.savedTracksUnchangedClient(probeCtx, tracks, total)
+		if err == nil {
+			return unchanged
+		}
+		applog.Warn("spotify: client protocol could not check saved tracks (%v), asking the web api", err)
+		if p.apiMode.skipsWeb() {
+			return false
+		}
+	}
+	return p.savedTracksUnchanged(probeCtx, tracks, total)
+}
+
 func (p *SpotifyProvider) savedTracksUnchanged(ctx context.Context, tracks []playlist.Track, total int) bool {
 	resp, err := p.webAPI(ctx, "GET", "/v1/me/tracks", url.Values{"limit": {"1"}})
 	if err != nil {
@@ -773,7 +840,7 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	if hit && (playlistID != savedTracksPlaylistID || p.savedTracksUnchanged(ctx, tracks, cachedTotal)) {
+	if hit && (playlistID != savedTracksPlaylistID || p.savedTracksCurrent(ctx, tracks, cachedTotal)) {
 		return tracks, 0, nil
 	}
 	// A resume is proved by comparing the page just fetched against the
@@ -786,6 +853,14 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 		if p.pending[playlistID] != nil {
 			delete(p.contextURIs, playlistID)
 		}
+		// Page zero is a new read, so neither path is refused yet. The flags
+		// exist to stop one read asking a refusing path once per page; letting
+		// them outlive that read would let a single transient failure route
+		// every later read down the other path for the life of the process --
+		// and for Liked Songs the other path is the one that pages fifty at a
+		// time, so the recovery would cost more than the failure did.
+		delete(p.declinedByWeb, playlistID)
+		delete(p.declinedByClient, playlistID)
 		p.mu.Unlock()
 	}
 

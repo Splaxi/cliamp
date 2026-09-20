@@ -254,7 +254,11 @@ func (p *SpotifyProvider) applyRevisions(entries []rootlistEntry) {
 			continue
 		}
 		if ok {
-			delete(p.contextURIs, id)
+			// Dropping only the resolve would leave a chain paging this list
+			// to re-resolve against the new revision and splice the two
+			// snapshots into one accumulation, which no later check can catch
+			// when the edit left the total alone. Discard the whole read.
+			p.discardLoadLocked(id)
 		}
 		p.trackCache[id] = &playlistCache{revision: rev}
 	}
