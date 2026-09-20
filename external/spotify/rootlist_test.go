@@ -198,7 +198,9 @@ func TestWebListingOnlyAdoptsClientSeededEntries(t *testing.T) {
 
 	t.Run("no provenance is dropped", func(t *testing.T) {
 		cache := map[string]*playlistCache{"a": {tracks: stale, total: 1}}
-		adoptSnapshot(cache, "a", "snap-2")
+		if !adoptSnapshot(cache, "a", "snap-2") {
+			t.Fatal("a cache with neither id was not reported dropped")
+		}
 		if c, ok := cache["a"]; ok && len(c.tracks) > 0 {
 			t.Error("a cache with neither id survived the listing, so a stale list is pinned forever")
 		}
@@ -206,7 +208,9 @@ func TestWebListingOnlyAdoptsClientSeededEntries(t *testing.T) {
 
 	t.Run("client seeded is adopted", func(t *testing.T) {
 		cache := map[string]*playlistCache{"a": {revision: "ab", tracks: stale, total: 1}}
-		adoptSnapshot(cache, "a", "snap-2")
+		if adoptSnapshot(cache, "a", "snap-2") {
+			t.Fatal("an adopted entry was reported dropped")
+		}
 		c, ok := cache["a"]
 		if !ok || len(c.tracks) != 1 {
 			t.Fatal("a client-seeded cache was dropped instead of adopting the snapshot")
@@ -218,9 +222,18 @@ func TestWebListingOnlyAdoptsClientSeededEntries(t *testing.T) {
 
 	t.Run("a moved snapshot still invalidates", func(t *testing.T) {
 		cache := map[string]*playlistCache{"a": {snapshotID: "snap-1", tracks: stale, total: 1}}
-		adoptSnapshot(cache, "a", "snap-2")
+		if !adoptSnapshot(cache, "a", "snap-2") {
+			t.Fatal("a moved snapshot was not reported dropped")
+		}
 		if c, ok := cache["a"]; ok && len(c.tracks) > 0 {
 			t.Error("a changed snapshot left the cached tracks in place")
+		}
+	})
+
+	t.Run("a never-cached playlist is left alone", func(t *testing.T) {
+		cache := map[string]*playlistCache{}
+		if adoptSnapshot(cache, "a", "snap-2") {
+			t.Fatal("a playlist the cache has never seen was reported dropped")
 		}
 	})
 }

@@ -8,6 +8,8 @@ import (
 	"testing"
 
 	"golang.org/x/oauth2"
+
+	"github.com/bjarneo/cliamp/playlist"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -82,5 +84,70 @@ func TestPlaylistsIncludesFollowedPlaylists(t *testing.T) {
 	}
 	if album.TrackCount != 17 {
 		t.Errorf("saved album track count = %d, want 17", album.TrackCount)
+	}
+}
+
+// The listing's cache decision must spare a playlist the cache has never
+// seen: its resolved URIs belong to a first read that may be paging the list
+// right now, and deleting them would make that read re-resolve and splice two
+// snapshots into one committed list. A playlist whose snapshot moved is the
+// opposite: the edit is proven, so the whole read is discarded, not just the
+// resolve -- the same protection a revision change gets.
+func TestWebListingSparesAFirstReadAndDiscardsAMovedSnapshot(t *testing.T) {
+	originalTransport := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body string
+		switch req.URL.Path {
+		case "/v1/me":
+			body = `{"id":"me"}`
+		case "/v1/me/tracks":
+			body = `{"total":0}`
+		case "/v1/me/playlists":
+			body = `{"items":[` +
+				`{"id":"fresh","name":"Fresh","snapshot_id":"three","owner":{"id":"me"},"items":{"total":1}},` +
+				`{"id":"moved","name":"Moved","snapshot_id":"two","owner":{"id":"me"},"items":{"total":1}}` +
+				`],"total":2}`
+		case "/v1/me/albums":
+			body = `{"items":[],"total":0}`
+		default:
+			return nil, fmt.Errorf("unexpected Spotify API path %q", req.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK",
+			Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+
+	sess := &Session{tokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "token"})}
+	p := New(sess, "client", 320)
+
+	// "fresh" is midway through its very first read: nothing is cached yet,
+	// so the read exists only as the resolve and the accumulation.
+	p.pending["fresh"] = &pendingTracks{total: 1, want: 1, tracks: []playlist.Track{{Path: "spotify:track:f0"}}}
+	p.contextURIs["fresh"] = []string{"spotify:track:f0"}
+
+	// "moved" is cached at "one"; the listing is about to report "two".
+	p.trackCache["moved"] = &playlistCache{snapshotID: "one", tracks: []playlist.Track{{Path: "spotify:track:m0"}}, total: 1}
+	p.pending["moved"] = &pendingTracks{total: 1, want: 1, tracks: []playlist.Track{{Path: "spotify:track:m0"}}}
+	p.contextURIs["moved"] = []string{"spotify:track:m0"}
+
+	if _, err := p.Playlists(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, ok := p.contextURIs["fresh"]; !ok {
+		t.Error("the listing deleted a first read's resolve, so its next page splices two snapshots")
+	}
+	if p.pending["fresh"] == nil {
+		t.Error("the listing discarded a first read's accumulation")
+	}
+
+	if p.pending["moved"] != nil {
+		t.Error("the accumulation survived a moved snapshot, so its next page splices two snapshots")
+	}
+	if _, ok := p.contextURIs["moved"]; ok {
+		t.Error("the resolve survived a moved snapshot")
+	}
+	if c := p.trackCache["moved"]; c == nil || c.snapshotID != "two" || len(c.tracks) != 0 {
+		t.Errorf("a moved snapshot left the entry %v, want a fresh marker at the new snapshot", c)
 	}
 }

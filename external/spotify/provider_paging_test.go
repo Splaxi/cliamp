@@ -666,3 +666,57 @@ func TestTracksRevalidatesCachedSavedTracks(t *testing.T) {
 			"0 means nothing was checked, more means the cache was skipped entirely", calls-before)
 	}
 }
+
+// Tracks() shares the refusal flags with the paged read, so a decline recorded
+// by an abandoned TracksPage read must not route a later Tracks() read down
+// the losing path either.
+func TestTracksForgetsADeclineFromAnAbandonedRead(t *testing.T) {
+	calls := 0
+	p := savedTracksProvider(t, 200, &calls)
+
+	attempts := 0
+	real := p.clientPage
+	p.clientPage = func(ctx context.Context, id string, off int) ([]playlist.Track, int, int, error) {
+		attempts++
+		return real(ctx, id, off)
+	}
+
+	// Abandon a paged read after page zero declines the client path.
+	if _, _, err := p.TracksPage("YOUR MUSIC", 0); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 1 {
+		t.Fatalf("client attempted %d times on page zero, want 1", attempts)
+	}
+
+	// Tracks() is a new read and must ask the client path again.
+	if _, err := p.Tracks("YOUR MUSIC"); err != nil {
+		t.Fatal(err)
+	}
+	if attempts != 2 {
+		t.Errorf("client attempted %d times across two reads, want 2 -- a decline outlived the read that recorded it", attempts)
+	}
+}
+
+// A read already paging Liked Songs is slicing the stored resolve. The cached
+// list cannot be proved current without taking that resolve away, so the check
+// must leave it alone and report unproven -- the re-read it causes is the
+// designed failure direction.
+func TestSavedTracksCheckLeavesALiveChainAlone(t *testing.T) {
+	p := &SpotifyProvider{
+		trackCache:  map[string]*playlistCache{},
+		pending:     map[string]*pendingTracks{"YOUR MUSIC": {total: 1, want: 1}},
+		contextURIs: map[string][]string{"YOUR MUSIC": {"spotify:track:a"}},
+	}
+
+	unchanged, err := p.savedTracksUnchangedClient(context.Background(), []playlist.Track{{Path: "spotify:track:a"}}, 1)
+	if err != nil {
+		t.Fatalf("a live chain made the check fail rather than report unproven: %v", err)
+	}
+	if unchanged {
+		t.Error("a live chain cannot prove the cache current, so the check must ask for a re-read")
+	}
+	if _, ok := p.contextURIs["YOUR MUSIC"]; !ok {
+		t.Error("the check deleted a live chain's resolve, so its next page splices two snapshots")
+	}
+}

@@ -333,9 +333,16 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 				TrackCount: count,
 				Section:    section,
 			})
-			adoptSnapshot(p.trackCache, item.ID, item.SnapshotID)
-			if _, ok := p.trackCache[item.ID]; !ok {
-				delete(p.contextURIs, item.ID)
+			// The snapshot moved under a list a read may still be paging.
+			// Dropping only the resolve would make that read's next page
+			// re-resolve against the new snapshot and splice the two into one
+			// committed list when the edit left the total alone -- the same
+			// reason applyRevisions discards the whole read. A playlist the
+			// cache has never seen keeps whatever read is live: there is
+			// nothing stale to drop, and deleting its resolve would splice
+			// that read for no gain.
+			if adoptSnapshot(p.trackCache, item.ID, item.SnapshotID) {
+				p.discardLoadLocked(item.ID)
 			}
 			// Store snapshot_id for later cache checks in Tracks().
 			if _, ok := p.trackCache[item.ID]; !ok && item.SnapshotID != "" {
@@ -714,18 +721,22 @@ func (p *SpotifyProvider) noteWebDeclined(playlistID string) {
 // not evidence of a change and is adopted. An entry with neither id has no
 // provenance -- a read that completed before any listing -- and is dropped, or
 // a list committed before an edit would adopt the snapshot taken after it and
-// never be invalidated again.
-func adoptSnapshot(cache map[string]*playlistCache, playlistID, snapshotID string) {
+// never be invalidated again. It reports whether the entry was dropped; a
+// playlist the cache has never seen is not one, and whatever read is paging it
+// right now must be left alone.
+func adoptSnapshot(cache map[string]*playlistCache, playlistID, snapshotID string) (dropped bool) {
 	cached, ok := cache[playlistID]
 	if !ok {
-		return
+		return false
 	}
 	switch {
 	case cached.snapshotID == "" && cached.revision != "":
 		cached.snapshotID = snapshotID
 	case cached.snapshotID != snapshotID:
 		delete(cache, playlistID)
+		return true
 	}
+	return false
 }
 
 func (p *SpotifyProvider) clearDeclinesLocked(playlistID string) {
