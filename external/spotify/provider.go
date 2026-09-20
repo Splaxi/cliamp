@@ -43,8 +43,10 @@ var (
 type playlistCache struct {
 	// snapshotID is the Web API's snapshot_id; revision is the client
 	// protocol's rootlist revision. They version the same playlist but are
-	// different id spaces, so each path compares only its own and a cache
-	// seeded by one is never invalidated by the other.
+	// different id spaces, so each path compares only its own. Neither is
+	// evidence about the other: an absent counterpart means "never seen by
+	// that path", so the Web API adopts it rather than reading it as a change,
+	// while the client path drops the entry, which is the safe direction.
 	snapshotID string
 	revision   string
 	tracks     []playlist.Track
@@ -96,7 +98,9 @@ const webTracksAttemptBudget = 6 * time.Second
 // savedTracksProbeBudget bounds the check that decides whether the cached
 // Liked Songs list is still current. It is an optimisation -- failing it costs
 // a re-read, not correctness -- so it must never sit in a Web API backoff for
-// the caller's whole deadline, which is how a cooldown gets extended.
+// the caller's whole deadline, which is how a cooldown gets extended. It is
+// spent across both paths, not granted to each: a client attempt that burns it
+// leaves the Web API none, which fails the check and re-reads.
 const savedTracksProbeBudget = 4 * time.Second
 
 // New creates a SpotifyProvider. If session is nil, authentication is
@@ -330,6 +334,11 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 					// Seeded by the client protocol, which versions playlists
 					// with a revision instead. Adopt the snapshot rather than
 					// read its absence as a change and throw the entry away.
+					// Tracks committed before an edit, first seen by this
+					// listing after it, adopt the post-edit snapshot and stay
+					// until the next rootlist listing compares revisions --
+					// this entry's normal invalidation path, which only the
+					// client protocol being unavailable delays.
 					cached.snapshotID = item.SnapshotID
 				case cached.snapshotID != item.SnapshotID:
 					delete(p.trackCache, item.ID)
@@ -473,14 +482,18 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 	}
 	// Check cache — if we have tracks and the snapshot_id hasn't changed, return cached.
 	p.mu.Lock()
-	if tracks, _, ok := p.cachedTracksLocked(playlistID); ok {
-		p.mu.Unlock()
-		return tracks, nil
-	}
+	tracks, cachedTotal, hit := p.cachedTracksLocked(playlistID)
 	p.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
+
+	// Liked Songs has no snapshot_id to invalidate it, so a committed list
+	// would otherwise be served here however old it is -- and this is the entry
+	// point the IPC and CLI callers use. Check it the way the paged read does.
+	if hit && (playlistID != savedTracksPlaylistID || p.savedTracksCurrent(ctx, tracks, cachedTotal)) {
+		return tracks, nil
+	}
 
 	// A like or unlike mid-load shifts every later offset, so pages read either
 	// side of the change splice into a list short by one and duplicated by one.
@@ -574,6 +587,12 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 	if !fallback {
 		return nil, 0, 0, err
 	}
+	// Pages read before and after this switch are spliced into one list, so the
+	// two paths must enumerate a playlist in the same order. Both are
+	// newest-first: the resolve was measured descending by added_at across a
+	// 6078-track collection with no violations, and /v1/me/tracks documents the
+	// same. If that ever diverges, an edit that leaves the total unchanged
+	// would commit a list spliced from two orderings.
 	applog.Warn("spotify: web api declined %q (%v), trying the client protocol", playlistID, err)
 	p.noteWebDeclined(playlistID)
 	tracks, total, size, cerr := clientTracksPage(p, ctx, playlistID, offset)

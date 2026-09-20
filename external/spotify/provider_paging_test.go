@@ -2,15 +2,14 @@ package spotify
 
 import (
 	"context"
-
 	"fmt"
-	"github.com/bjarneo/cliamp/playlist"
 	"io"
 	"net/http"
 	"strconv"
 	"strings"
 	"testing"
 
+	"github.com/bjarneo/cliamp/playlist"
 	"golang.org/x/oauth2"
 )
 
@@ -643,5 +642,26 @@ func TestTracksPageForgetsADeclineFromAnAbandonedRead(t *testing.T) {
 	}
 	if attempts != 2 {
 		t.Errorf("client attempted %d times across two reads, want 2 -- a decline outlived the read that recorded it", attempts)
+	}
+}
+
+// Tracks serves the committed list to IPC and CLI callers. Liked Songs has no
+// snapshot_id to invalidate it, so without a check of its own those callers
+// would get a list of any age.
+func TestTracksRevalidatesCachedSavedTracks(t *testing.T) {
+	calls := 0
+	p := savedTracksProvider(t, 100, &calls)
+
+	first, err := p.Tracks("YOUR MUSIC")
+	if err != nil || len(first) != 100 {
+		t.Fatalf("first read: %d tracks, err=%v", len(first), err)
+	}
+	before := calls
+
+	if _, err := p.Tracks("YOUR MUSIC"); err != nil {
+		t.Fatal(err)
+	}
+	if calls == before {
+		t.Error("a cached read checked nothing, so a stale list would be served forever")
 	}
 }
