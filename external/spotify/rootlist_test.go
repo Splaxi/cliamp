@@ -3,6 +3,7 @@ package spotify
 import (
 	"testing"
 
+	"github.com/bjarneo/cliamp/playlist"
 	playlist4pb "github.com/devgianlu/go-librespot/proto/spotify/playlist4"
 	"google.golang.org/protobuf/proto"
 )
@@ -93,5 +94,67 @@ func TestRootlistPlaylistsIgnoresMismatchedEndGroup(t *testing.T) {
 	}
 	if got[1].Section != "Outer / Inner" {
 		t.Errorf("section after a mismatched end-group = %q, want the stack left intact", got[1].Section)
+	}
+}
+
+func revEntry(id string, rev []byte) rootlistEntry {
+	return rootlistEntry{URI: "spotify:playlist:" + id, Name: id, TrackCount: 1, Owner: "listener", Revision: rev}
+}
+
+// In auto mode the client protocol leads the listing, so the Web API's
+// snapshot_id compare never runs. Without the rootlist revision standing in for
+// it, a playlist edited elsewhere would serve its cached tracks forever.
+func TestApplyRevisionsDropsCacheWhenRevisionMoves(t *testing.T) {
+	p := &SpotifyProvider{
+		trackCache:  map[string]*playlistCache{},
+		contextURIs: map[string][]string{},
+	}
+	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{1})})
+	p.trackCache["a"].tracks = []playlist.Track{{Path: "spotify:track:x"}}
+	p.contextURIs["a"] = []string{"spotify:track:x"}
+
+	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{1})})
+	if p.trackCache["a"] == nil || len(p.trackCache["a"].tracks) != 1 {
+		t.Error("an unchanged revision dropped the cache")
+	}
+	if len(p.contextURIs["a"]) != 1 {
+		t.Error("an unchanged revision dropped the resolved URIs")
+	}
+
+	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{2})})
+	if c := p.trackCache["a"]; c == nil || len(c.tracks) != 0 {
+		t.Error("a changed revision left the cached tracks in place")
+	}
+	if _, ok := p.contextURIs["a"]; ok {
+		t.Error("a changed revision left the resolved URIs in place")
+	}
+}
+
+// The library does not report a revision for every entry, so an entry without
+// one must not be read as "changed" and throw away a good cache every listing.
+func TestApplyRevisionsIgnoresEntriesWithoutOne(t *testing.T) {
+	p := &SpotifyProvider{
+		trackCache:  map[string]*playlistCache{"a": {revision: "01", tracks: []playlist.Track{{Path: "spotify:track:x"}}}},
+		contextURIs: map[string][]string{},
+	}
+	p.applyRevisions([]rootlistEntry{revEntry("a", nil)})
+	if c := p.trackCache["a"]; c == nil || len(c.tracks) != 1 {
+		t.Error("an entry with no revision invalidated the cache")
+	}
+}
+
+// A cache seeded by the Web API's snapshot_id must not be invalidated by a
+// rootlist revision: they version the same playlist in different id spaces.
+func TestApplyRevisionsDoesNotCollideWithSnapshotIDs(t *testing.T) {
+	p := &SpotifyProvider{
+		trackCache:  map[string]*playlistCache{},
+		contextURIs: map[string][]string{},
+	}
+	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{0xAB})})
+	if got := p.trackCache["a"].snapshotID; got != "" {
+		t.Errorf("revision leaked into snapshotID as %q", got)
+	}
+	if got := p.trackCache["a"].revision; got != "ab" {
+		t.Errorf("revision = %q, want %q", got, "ab")
 	}
 }

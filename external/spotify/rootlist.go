@@ -2,6 +2,7 @@ package spotify
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"net/url"
@@ -34,6 +35,7 @@ type rootlistEntry struct {
 	Name       string
 	TrackCount int
 	Owner      string
+	Revision   []byte // playlist version, for cache invalidation
 	FolderID   string // set for boundaries
 	FolderOpen bool   // true for start-group, false for end-group
 }
@@ -109,6 +111,7 @@ func parseRootlist(content *playlist4pb.SelectedListContent) ([]rootlistEntry, e
 				e.Name = m.GetAttributes().GetName()
 				e.TrackCount = int(m.GetLength())
 				e.Owner = m.GetOwnerUsername()
+				e.Revision = m.GetRevision()
 			}
 			entries = append(entries, e)
 		}
@@ -166,6 +169,7 @@ func (p *SpotifyProvider) playlistsFromRootlist(ctx context.Context) ([]playlist
 		})
 	}
 
+	p.applyRevisions(entries)
 	lists = append(lists, p.rootlistPlaylists(entries, p.session.sess.Username())...)
 
 	if albums, err := p.savedAlbums(enrich); err == nil {
@@ -228,6 +232,32 @@ func (p *SpotifyProvider) rootlistPlaylists(entries []rootlistEntry, userID stri
 		})
 	}
 	return lists
+}
+
+// applyRevisions drops a playlist's cached tracks when the library reports a
+// revision different from the one they were read at. The Web API listing does
+// the same with snapshot_id, but in auto mode the client protocol leads and
+// that listing never runs, so without this an edit made elsewhere would never
+// reach a committed cache. An entry with no revision says nothing, so it
+// changes nothing: the library does not report one for every playlist.
+func (p *SpotifyProvider) applyRevisions(entries []rootlistEntry) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, e := range entries {
+		if e.isFolder() || len(e.Revision) == 0 {
+			continue
+		}
+		id := playlistIDFromURI(e.URI)
+		rev := hex.EncodeToString(e.Revision)
+		cached, ok := p.trackCache[id]
+		if ok && cached.revision == rev {
+			continue
+		}
+		if ok {
+			delete(p.contextURIs, id)
+		}
+		p.trackCache[id] = &playlistCache{revision: rev}
+	}
 }
 
 // spotifyOwner is the owner the library reports for Spotify's own entries.

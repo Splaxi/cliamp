@@ -41,7 +41,12 @@ var (
 // playlistCache holds a snapshot_id and the fetched tracks for a playlist,
 // allowing us to skip re-fetching playlists that haven't changed.
 type playlistCache struct {
+	// snapshotID is the Web API's snapshot_id; revision is the client
+	// protocol's rootlist revision. They version the same playlist but are
+	// different id spaces, so each path compares only its own and a cache
+	// seeded by one is never invalidated by the other.
 	snapshotID string
+	revision   string
 	tracks     []playlist.Track
 	total      int
 }
