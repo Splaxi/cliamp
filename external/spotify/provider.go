@@ -80,7 +80,11 @@ type SpotifyProvider struct {
 	declinedByWeb    map[string]bool     // playlist ID -> the web api refused it this read
 	declinedByClient map[string]bool     // playlist ID -> the client protocol refused it this read
 	apiMode          apiMode             // which read path to prefer; see CLIAMP_SPOTIFY_API
-	authCancel       context.CancelFunc  // cancels any in-progress OAuth flow
+	// clientPage is the client-protocol read, indirected so tests can count the
+	// attempts the decline flags exist to prevent: a failed attempt is
+	// otherwise indistinguishable from one that never happened. Always set.
+	clientPage func(context.Context, string, int) ([]playlist.Track, int, int, error)
+	authCancel context.CancelFunc // cancels any in-progress OAuth flow
 
 	// Playlist list cache to avoid redundant API calls on provider switch.
 	listCache   []playlist.PlaylistInfo
@@ -107,7 +111,7 @@ const savedTracksProbeBudget = 4 * time.Second
 // deferred until the user first selects the Spotify provider.
 // bitrate sets the preferred Spotify stream quality in kbps (96, 160, or 320).
 func New(session *Session, clientID string, bitrate int) *SpotifyProvider {
-	return &SpotifyProvider{
+	p := &SpotifyProvider{
 		session:          session,
 		clientID:         clientID,
 		bitrate:          bitrate,
@@ -118,6 +122,8 @@ func New(session *Session, clientID string, bitrate int) *SpotifyProvider {
 		declinedByClient: make(map[string]bool),
 		apiMode:          resolveAPIMode(),
 	}
+	p.clientPage = p.contextTracksPage
+	return p
 }
 
 // ensureSession tries to create a session using stored credentials only
@@ -327,23 +333,9 @@ func (p *SpotifyProvider) Playlists() ([]playlist.PlaylistInfo, error) {
 				TrackCount: count,
 				Section:    section,
 			})
-			// Update snapshot_id in cache; if it changed, invalidate cached tracks.
-			if cached, ok := p.trackCache[item.ID]; ok {
-				switch {
-				case cached.snapshotID == "":
-					// Seeded by the client protocol, which versions playlists
-					// with a revision instead. Adopt the snapshot rather than
-					// read its absence as a change and throw the entry away.
-					// Tracks committed before an edit, first seen by this
-					// listing after it, adopt the post-edit snapshot and stay
-					// until the next rootlist listing compares revisions --
-					// this entry's normal invalidation path, which only the
-					// client protocol being unavailable delays.
-					cached.snapshotID = item.SnapshotID
-				case cached.snapshotID != item.SnapshotID:
-					delete(p.trackCache, item.ID)
-					delete(p.contextURIs, item.ID)
-				}
+			adoptSnapshot(p.trackCache, item.ID, item.SnapshotID)
+			if _, ok := p.trackCache[item.ID]; !ok {
+				delete(p.contextURIs, item.ID)
 			}
 			// Store snapshot_id for later cache checks in Tracks().
 			if _, ok := p.trackCache[item.ID]; !ok && item.SnapshotID != "" {
@@ -483,6 +475,7 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 	// Check cache — if we have tracks and the snapshot_id hasn't changed, return cached.
 	p.mu.Lock()
 	tracks, cachedTotal, hit := p.cachedTracksLocked(playlistID)
+	p.clearDeclinesLocked(playlistID)
 	p.mu.Unlock()
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -538,11 +531,6 @@ func (p *SpotifyProvider) Tracks(playlistID string) ([]playlist.Track, error) {
 // the user's own playlists there, so the common case stays on the documented
 // path; a playlist owned by someone else, or a Spotify-owned mix, comes back
 // 403 and is readable only through the client protocol.
-// clientTracksPage is the client-protocol read, indirected so tests can count
-// the attempts the decline flags are meant to prevent. A failed attempt is
-// otherwise indistinguishable from one that never happened.
-var clientTracksPage = (*SpotifyProvider).contextTracksPage
-
 func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string, offset int) ([]playlist.Track, int, int, error) {
 	fallback := p.apiMode.usesClient()
 
@@ -551,7 +539,7 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 	// a large library -- and hammering an API that is rate limiting is how a
 	// cooldown gets extended.
 	if fallback && (p.apiMode.skipsWeb() || p.webDeclined(playlistID)) {
-		return clientTracksPage(p, ctx, playlistID, offset)
+		return p.clientPage(ctx, playlistID, offset)
 	}
 
 	// Liked Songs leads with the client protocol. The Web API does not refuse
@@ -561,7 +549,7 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 	// The list cannot lose anything in the move: Spotify keeps saved episodes
 	// in a separate collection, so this one holds nothing but tracks.
 	if fallback && playlistID == savedTracksPlaylistID && !p.clientDeclined(playlistID) {
-		tracks, total, size, err := clientTracksPage(p, ctx, playlistID, offset)
+		tracks, total, size, err := p.clientPage(ctx, playlistID, offset)
 		if err == nil {
 			return tracks, total, size, nil
 		}
@@ -595,7 +583,7 @@ func (p *SpotifyProvider) fetchTracksPage(ctx context.Context, playlistID string
 	// would commit a list spliced from two orderings.
 	applog.Warn("spotify: web api declined %q (%v), trying the client protocol", playlistID, err)
 	p.noteWebDeclined(playlistID)
-	tracks, total, size, cerr := clientTracksPage(p, ctx, playlistID, offset)
+	tracks, total, size, cerr := p.clientPage(ctx, playlistID, offset)
 	if cerr != nil {
 		// Report the Web API's refusal: it is the documented path and its error
 		// says why the playlist is unreadable.
@@ -714,6 +702,37 @@ func (p *SpotifyProvider) noteWebDeclined(playlistID string) {
 // the lists the client protocol leads. Without them a failing resolve would be
 // retried once per page on the way to the Web API, which is the cost the Web
 // API's own stickiness exists to avoid.
+// clearDeclinesLocked forgets which paths refused a playlist. The flags exist
+// to stop one read asking a refusing path once per page, so they are cleared
+// when a read starts: letting them outlive their read would let one transient
+// failure route every later read down the other path for the life of the
+// process, and for Liked Songs the other path is the one that pages fifty at a
+// time, so recovering would cost more than the failure did. p.mu must be held.
+// adoptSnapshot reconciles a cached playlist with the snapshot_id the Web API
+// listing just reported. An entry carrying a revision was seeded by the client
+// protocol, which versions playlists differently, so its missing snapshot is
+// not evidence of a change and is adopted. An entry with neither id has no
+// provenance -- a read that completed before any listing -- and is dropped, or
+// a list committed before an edit would adopt the snapshot taken after it and
+// never be invalidated again.
+func adoptSnapshot(cache map[string]*playlistCache, playlistID, snapshotID string) {
+	cached, ok := cache[playlistID]
+	if !ok {
+		return
+	}
+	switch {
+	case cached.snapshotID == "" && cached.revision != "":
+		cached.snapshotID = snapshotID
+	case cached.snapshotID != snapshotID:
+		delete(cache, playlistID)
+	}
+}
+
+func (p *SpotifyProvider) clearDeclinesLocked(playlistID string) {
+	delete(p.declinedByWeb, playlistID)
+	delete(p.declinedByClient, playlistID)
+}
+
 func (p *SpotifyProvider) clientDeclined(playlistID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -771,9 +790,19 @@ func (p *SpotifyProvider) cacheTracksLocked(playlistID string, tracks []playlist
 // The resolve is taken fresh and then dropped: a stored one would outlive the
 // check and could serve a later read from a snapshot nothing revalidated.
 func (p *SpotifyProvider) savedTracksUnchangedClient(ctx context.Context, tracks []playlist.Track, total int) (bool, error) {
+	// A read already paging this list is slicing the stored resolve. Taking it
+	// away would make that read's next page re-resolve and splice two snapshots
+	// into one list, so leave a live chain alone and let the check fail into a
+	// re-read instead.
 	p.mu.Lock()
-	delete(p.contextURIs, savedTracksPlaylistID)
+	live := p.pending[savedTracksPlaylistID] != nil
+	if !live {
+		delete(p.contextURIs, savedTracksPlaylistID)
+	}
 	p.mu.Unlock()
+	if live {
+		return false, nil
+	}
 
 	uris, err := p.contextTrackURIs(ctx, savedTracksPlaylistID)
 
@@ -872,14 +901,7 @@ func (p *SpotifyProvider) TracksPage(playlistID string, offset int) ([]playlist.
 		if p.pending[playlistID] != nil {
 			delete(p.contextURIs, playlistID)
 		}
-		// Page zero is a new read, so neither path is refused yet. The flags
-		// exist to stop one read asking a refusing path once per page; letting
-		// them outlive that read would let a single transient failure route
-		// every later read down the other path for the life of the process --
-		// and for Liked Songs the other path is the one that pages fifty at a
-		// time, so the recovery would cost more than the failure did.
-		delete(p.declinedByWeb, playlistID)
-		delete(p.declinedByClient, playlistID)
+		p.clearDeclinesLocked(playlistID)
 		p.mu.Unlock()
 	}
 

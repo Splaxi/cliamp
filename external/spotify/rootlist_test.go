@@ -187,3 +187,40 @@ func TestApplyRevisionsDiscardsAnInFlightRead(t *testing.T) {
 		t.Error("the resolve survived a revision change")
 	}
 }
+
+// A read that finishes before any listing commits its tracks with neither id.
+// The Web API listing must still drop such an entry: adopting its snapshot
+// would pin a list committed before an edit to the snapshot taken after one,
+// and nothing would ever invalidate it again. Only an entry carrying a revision
+// is evidence that the client protocol seeded it.
+func TestWebListingOnlyAdoptsClientSeededEntries(t *testing.T) {
+	stale := []playlist.Track{{Path: "spotify:track:old"}}
+
+	t.Run("no provenance is dropped", func(t *testing.T) {
+		cache := map[string]*playlistCache{"a": {tracks: stale, total: 1}}
+		adoptSnapshot(cache, "a", "snap-2")
+		if c, ok := cache["a"]; ok && len(c.tracks) > 0 {
+			t.Error("a cache with neither id survived the listing, so a stale list is pinned forever")
+		}
+	})
+
+	t.Run("client seeded is adopted", func(t *testing.T) {
+		cache := map[string]*playlistCache{"a": {revision: "ab", tracks: stale, total: 1}}
+		adoptSnapshot(cache, "a", "snap-2")
+		c, ok := cache["a"]
+		if !ok || len(c.tracks) != 1 {
+			t.Fatal("a client-seeded cache was dropped instead of adopting the snapshot")
+		}
+		if c.snapshotID != "snap-2" {
+			t.Errorf("snapshotID = %q, want it adopted", c.snapshotID)
+		}
+	})
+
+	t.Run("a moved snapshot still invalidates", func(t *testing.T) {
+		cache := map[string]*playlistCache{"a": {snapshotID: "snap-1", tracks: stale, total: 1}}
+		adoptSnapshot(cache, "a", "snap-2")
+		if c, ok := cache["a"]; ok && len(c.tracks) > 0 {
+			t.Error("a changed snapshot left the cached tracks in place")
+		}
+	})
+}

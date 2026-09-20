@@ -588,12 +588,11 @@ func TestTracksPageStopsRetryingADecliningClientPath(t *testing.T) {
 	p := savedTracksProvider(t, 200, &calls)
 
 	attempts := 0
-	real := clientTracksPage
-	clientTracksPage = func(p *SpotifyProvider, ctx context.Context, id string, off int) ([]playlist.Track, int, int, error) {
+	real := p.clientPage
+	p.clientPage = func(ctx context.Context, id string, off int) ([]playlist.Track, int, int, error) {
 		attempts++
-		return real(p, ctx, id, off)
+		return real(ctx, id, off)
 	}
-	t.Cleanup(func() { clientTracksPage = real })
 
 	// No librespot session, so every client attempt fails and the Web API serves.
 	if got := drainSavedTracks(t, p); got != 200 {
@@ -604,13 +603,15 @@ func TestTracksPageStopsRetryingADecliningClientPath(t *testing.T) {
 	}
 
 	// The read committed, so a second one is served from the cache and never
-	// reaches either path. Decline clearing is pinned by the abandoned-read
-	// case below, which is the one that strands a list on the expensive path.
+	// pages either path. (Its revalidation probe does resolve, but through
+	// contextTrackURIs rather than the paging seam counted here.) Decline
+	// clearing is pinned by the abandoned-read case below, which is the one
+	// that strands a list on the expensive path.
 	if got := drainSavedTracks(t, p); got != 200 {
 		t.Fatalf("second read collected %d tracks, want 200", got)
 	}
 	if attempts != 1 {
-		t.Errorf("a cached read attempted the client path %d times, want 0 more", attempts-1)
+		t.Errorf("a cached read paged the client path %d more times, want 0", attempts-1)
 	}
 }
 
@@ -621,12 +622,11 @@ func TestTracksPageForgetsADeclineFromAnAbandonedRead(t *testing.T) {
 	p := savedTracksProvider(t, 200, &calls)
 
 	attempts := 0
-	real := clientTracksPage
-	clientTracksPage = func(p *SpotifyProvider, ctx context.Context, id string, off int) ([]playlist.Track, int, int, error) {
+	real := p.clientPage
+	p.clientPage = func(ctx context.Context, id string, off int) ([]playlist.Track, int, int, error) {
 		attempts++
-		return real(p, ctx, id, off)
+		return real(ctx, id, off)
 	}
-	t.Cleanup(func() { clientTracksPage = real })
 
 	// Read page zero, then walk away without finishing the list.
 	if _, _, err := p.TracksPage("YOUR MUSIC", 0); err != nil {
@@ -661,7 +661,8 @@ func TestTracksRevalidatesCachedSavedTracks(t *testing.T) {
 	if _, err := p.Tracks("YOUR MUSIC"); err != nil {
 		t.Fatal(err)
 	}
-	if calls == before {
-		t.Error("a cached read checked nothing, so a stale list would be served forever")
+	if calls != before+1 {
+		t.Errorf("a cached read made %d requests, want exactly 1 (the revalidation probe); "+
+			"0 means nothing was checked, more means the cache was skipped entirely", calls-before)
 	}
 }
