@@ -102,6 +102,8 @@ Set `CLIAMP_SPOTIFY_API` to change this:
 | `client` | Client protocol only. Useful when the Web API is rate limiting, and it makes a broken internal endpoint visible rather than silently masked. |
 | `web` | Web API only. Cliamp's behaviour before the client protocol was added; folders, saved radios and other people's playlists are unavailable. |
 
+Track counts beside folder-grouped playlists come from Spotify's own library listing and are a cached figure, so one can sit a track or two off what the playlist actually holds. The list itself is always read fresh.
+
 A playlist read through the client protocol serves songs only: podcast episodes and your own local files ride in the same list but cannot be played from there, so they are skipped. In `auto` this affects only playlists the Web API refused, which previously showed nothing at all.
 
 The client protocol is undocumented and can change without notice, which is why every path falls back to the Web API and why `web` exists as an escape hatch.
