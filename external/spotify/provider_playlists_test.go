@@ -87,6 +87,50 @@ func TestPlaylistsIncludesFollowedPlaylists(t *testing.T) {
 	}
 }
 
+// Auto mode leads the listing with the rootlist. When that endpoint is
+// unavailable the whole library must still arrive through the Web API, since a
+// lesser listing beats none at all.
+func TestPlaylistsFallsBackToWebWhenRootlistUnavailable(t *testing.T) {
+	originalTransport := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		var body string
+		switch req.URL.Path {
+		case "/v1/me":
+			body = `{"id":"me"}`
+		case "/v1/me/tracks":
+			body = `{"total":1}`
+		case "/v1/me/playlists":
+			body = `{"items":[` +
+				`{"id":"owned","name":"Owned","snapshot_id":"one","owner":{"id":"me"},"items":{"total":2}}` +
+				`],"total":1}`
+		case "/v1/me/albums":
+			body = `{"items":[],"total":0}`
+		default:
+			return nil, fmt.Errorf("unexpected Spotify API path %q", req.URL.Path)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Status: "200 OK",
+			Header: make(http.Header), Body: io.NopCloser(strings.NewReader(body)), Request: req}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+
+	// The session has no librespot connection, so the rootlist read fails and
+	// auto mode falls back to the Web API listing.
+	sess := &Session{tokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "token"})}
+	got, err := New(sess, "client", 320).Playlists()
+	if err != nil {
+		t.Fatalf("listing fell back to an error: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("got %d playlists, want 2: %#v", len(got), got)
+	}
+	if got[0].ID != "YOUR MUSIC" || got[0].Section != "Library" || got[0].TrackCount != 1 {
+		t.Errorf("liked songs row = %+v", got[0])
+	}
+	if got[1].ID != "owned" || got[1].Section != "Your playlists" {
+		t.Errorf("playlist row = %+v", got[1])
+	}
+}
+
 // The listing's cache decision must spare a playlist the cache has never
 // seen: its resolved URIs belong to a first read that may be paging the list
 // right now, and deleting them would make that read re-resolve and splice two

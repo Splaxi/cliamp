@@ -632,7 +632,6 @@ func createSpotPlaylistCmd(ctx context.Context, c provider.PlaylistCreator, w pr
 
 // trackRadioMsg carries a station built from a track back to the model.
 type trackRadioMsg struct {
-	name         string
 	seed         playlist.Track
 	tracks       []playlist.Track
 	providerName string
@@ -647,7 +646,7 @@ func startTrackRadioCmd(starter provider.RadioStarter, name string, seed playlis
 	return func() tea.Msg {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		station, tracks, err := starter.TrackRadio(ctx, seed.Path)
-		return trackRadioMsg{name: station, seed: seed, tracks: tracks, providerName: name, gen: gen, err: err}
+		tracks, err := starter.TrackRadio(ctx, seed.Path)
+		return trackRadioMsg{seed: seed, tracks: tracks, providerName: name, gen: gen, err: err}
 	}
 }

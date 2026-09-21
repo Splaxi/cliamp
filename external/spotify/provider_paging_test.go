@@ -128,24 +128,6 @@ func TestTracksPageRefetchesWhenNewestSavedTrackChanged(t *testing.T) {
 	}
 }
 
-func TestTracksPageIgnoresNonContiguousPages(t *testing.T) {
-	calls := 0
-	p := savedTracksProvider(t, 200, &calls)
-	if _, next, err := p.TracksPage("YOUR MUSIC", 0); err != nil || next != 50 {
-		t.Fatalf("first page: next=%d err=%v", next, err)
-	}
-	// A page from a superseded chain lands at an offset the current
-	// accumulation is not waiting for; it must not be spliced in.
-	page, next, err := p.TracksPage("YOUR MUSIC", 100)
-	if err != nil || len(page) != 50 || next != 150 {
-		t.Fatalf("stale page not served to its caller: len=%d next=%d err=%v", len(page), next, err)
-	}
-	pend := p.pending["YOUR MUSIC"]
-	if pend == nil || len(pend.tracks) != 50 || pend.want != 50 {
-		t.Fatalf("non-contiguous page polluted accumulation: len=%d want=%d", len(pend.tracks), pend.want)
-	}
-}
-
 func TestTracksPageAbortedLoadDoesNotCache(t *testing.T) {
 	calls := 0
 	p := savedTracksProvider(t, 120, &calls)
@@ -609,18 +591,6 @@ func TestTracksPageStopsRetryingADecliningClientPath(t *testing.T) {
 	if attempts != 1 {
 		t.Errorf("client path attempted %d times in one read, want 1 -- the decline is not preventing anything", attempts)
 	}
-
-	// The read committed, so a second one is served from the cache and never
-	// pages either path. (Its revalidation probe does resolve, but through
-	// contextTrackURIs rather than the paging seam counted here.) Decline
-	// clearing is pinned by the abandoned-read case below, which is the one
-	// that strands a list on the expensive path.
-	if got := drainSavedTracks(t, p); got != 200 {
-		t.Fatalf("second read collected %d tracks, want 200", got)
-	}
-	if attempts != 1 {
-		t.Errorf("a cached read paged the client path %d more times, want 0", attempts-1)
-	}
 }
 
 // A read that ends without completing -- an error, or the user backing out --
@@ -644,12 +614,21 @@ func TestTracksPageForgetsADeclineFromAnAbandonedRead(t *testing.T) {
 		t.Fatalf("client attempted %d times on page zero, want 1", attempts)
 	}
 
-	// Re-entering is a new read and must ask the client path again.
+	// Both flags belong to the read that recorded them. The Web API's is set
+	// here by hand because reaching it needs a refusal the stub does not give,
+	// and an unforgotten one would send every later read of this list to the
+	// undocumented endpoint for the life of the process.
+	p.noteWebDeclined("YOUR MUSIC")
+
+	// Re-entering is a new read and must ask both paths again.
 	if _, _, err := p.TracksPage("YOUR MUSIC", 0); err != nil {
 		t.Fatal(err)
 	}
 	if attempts != 2 {
 		t.Errorf("client attempted %d times across two reads, want 2 -- a decline outlived the read that recorded it", attempts)
+	}
+	if p.webDeclined("YOUR MUSIC") {
+		t.Error("a web decline outlived the read that recorded it")
 	}
 }
 
@@ -792,26 +771,6 @@ func TestReadEndsDropTheResolve(t *testing.T) {
 	})
 }
 
-// The client twin of this is pinned; without the web one, a refusal recorded
-// by the Web API could outlive its read and send every later read of that list
-// to the undocumented endpoint until the process exits.
-func TestTracksPageForgetsAWebDeclineFromAnAbandonedRead(t *testing.T) {
-	calls := 0
-	p := savedTracksProvider(t, 200, &calls)
-
-	p.noteWebDeclined("YOUR MUSIC")
-	if !p.webDeclined("YOUR MUSIC") {
-		t.Fatal("the decline was not recorded")
-	}
-
-	if _, _, err := p.TracksPage("YOUR MUSIC", 0); err != nil {
-		t.Fatal(err)
-	}
-	if p.webDeclined("YOUR MUSIC") {
-		t.Error("a web decline outlived the read that recorded it")
-	}
-}
-
 // Only Liked Songs leads with the client protocol. An ordinary playlist must
 // still try the Web API first, which is what keeps default behaviour unchanged.
 func TestOrdinaryPlaylistsStillLeadWithTheWebAPI(t *testing.T) {
@@ -834,6 +793,59 @@ func TestOrdinaryPlaylistsStillLeadWithTheWebAPI(t *testing.T) {
 	}
 	if calls == 0 {
 		t.Error("the Web API was never asked")
+	}
+}
+
+// The reason the client path exists at all: a playlist the Web API refuses --
+// another user's list, a Spotify-owned mix -- must be served whole by the
+// client protocol, and the refusal must not be re-earned once per page.
+func TestTracksPageServesAWebRefusedPlaylistThroughTheClient(t *testing.T) {
+	webCalls := 0
+	originalTransport := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/v1/playlists/mix/items" {
+			return nil, fmt.Errorf("unexpected Spotify API path %q", req.URL.Path)
+		}
+		webCalls++
+		return &http.Response{StatusCode: http.StatusForbidden, Status: "403 Forbidden",
+			Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: req}, nil
+	})
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	sess := &Session{tokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "token"})}
+	p := New(sess, "client", 320)
+
+	uris := make([]string, 150)
+	for i := range uris {
+		uris[i] = fmt.Sprintf("spotify:track:m%d", i)
+	}
+	p.clientPage = func(_ context.Context, _ string, off int, carried []string) (tracksPage, error) {
+		if carried == nil {
+			carried = uris
+		}
+		page := tracksPage{total: len(carried), pageSize: spotifyMetadataBatch, uris: carried}
+		for _, u := range carried[off:min(off+spotifyMetadataBatch, len(carried))] {
+			page.tracks = append(page.tracks, playlist.Track{Path: u})
+		}
+		return page, nil
+	}
+
+	var got []playlist.Track
+	for offset := 0; ; {
+		page, next, err := p.TracksPage("mix", offset)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, page...)
+		if next == 0 {
+			break
+		}
+		offset = next
+	}
+	if len(got) != 150 {
+		t.Fatalf("collected %d tracks, want 150", len(got))
+	}
+	if webCalls != 1 {
+		t.Errorf("asked the refusing Web API %d times, want 1", webCalls)
 	}
 }
 

@@ -172,22 +172,22 @@ func (p *SpotifyProvider) contextTracksPage(ctx context.Context, playlistID stri
 // context, so the metadata is filled in the same way.
 //
 // Implements provider.RadioStarter.
-func (p *SpotifyProvider) TrackRadio(ctx context.Context, trackPath string) (string, []playlist.Track, error) {
+func (p *SpotifyProvider) TrackRadio(ctx context.Context, trackPath string) ([]playlist.Track, error) {
 	if err := p.ensureSession(); err != nil {
-		return "", nil, err
+		return nil, err
 	}
 	if !strings.HasPrefix(trackPath, "spotify:track:") {
-		return "", nil, fmt.Errorf("spotify: radio: %q is not a spotify track", trackPath)
+		return nil, fmt.Errorf("spotify: radio: %q is not a spotify track", trackPath)
 	}
 	sess := p.session
 	if sess == nil || sess.sess == nil {
-		return "", nil, fmt.Errorf("spotify: radio: no session")
+		return nil, fmt.Errorf("spotify: radio: no session")
 	}
 
 	uri := trackPath
 	station, err := sess.sess.Spclient().ContextResolveAutoplay(ctx, &playerpb.AutoplayContextRequest{ContextUri: &uri})
 	if err != nil {
-		return "", nil, fmt.Errorf("spotify: radio for %q: %w", trackPath, err)
+		return nil, fmt.Errorf("spotify: radio for %q: %w", trackPath, err)
 	}
 
 	var uris []string
@@ -199,7 +199,7 @@ func (p *SpotifyProvider) TrackRadio(ctx context.Context, trackPath string) (str
 		}
 	}
 	if len(uris) == 0 {
-		return "", nil, fmt.Errorf("spotify: radio for %q: station is empty", trackPath)
+		return nil, fmt.Errorf("spotify: radio for %q: station is empty", trackPath)
 	}
 
 	// Stations come back around fifty tracks long, which is one metadata batch.
@@ -209,9 +209,9 @@ func (p *SpotifyProvider) TrackRadio(ctx context.Context, trackPath string) (str
 		end := min(start+spotifyMetadataBatch, len(uris))
 		batch, err := p.trackMetadata(ctx, uris[start:end])
 		if err != nil {
-			return "", nil, err
+			return nil, err
 		}
 		tracks = append(tracks, batch...)
 	}
-	return station.GetUri(), tracks, nil
+	return tracks, nil
 }

@@ -410,8 +410,7 @@ type TrackPager interface {
 }
 
 // RadioStarter is implemented by providers that can build a station from a
-// track: the endless mix a service generates from one song. The name is
-// whatever the service calls the station, for the UI to report.
+// track: the endless mix a service generates from one song.
 type RadioStarter interface {
-	TrackRadio(ctx context.Context, trackPath string) (name string, tracks []playlist.Track, err error)
+	TrackRadio(ctx context.Context, trackPath string) ([]playlist.Track, error)
 }

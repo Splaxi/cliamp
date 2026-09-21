@@ -35,7 +35,6 @@ var (
 	_ provider.TrackPager      = (*SpotifyProvider)(nil)
 )
 
-// maxResponseBody limits JSON API responses to 10 MB.
 // SpotifyProvider implements playlist.Provider using the Spotify Web API
 // for playlist/track metadata and go-librespot for audio streaming.
 // playlistCache holds a snapshot_id and the fetched tracks for a playlist,
@@ -724,16 +723,6 @@ func (p *SpotifyProvider) noteWebDeclined(playlistID string) {
 	p.declinedByWeb[playlistID] = true
 }
 
-// clientDeclined and noteClientDeclined are the mirror of the two above, for
-// the lists the client protocol leads. Without them a failing resolve would be
-// retried once per page on the way to the Web API, which is the cost the Web
-// API's own stickiness exists to avoid.
-// clearDeclinesLocked forgets which paths refused a playlist. The flags exist
-// to stop one read asking a refusing path once per page, so they are cleared
-// when a read starts: letting them outlive their read would let one transient
-// failure route every later read down the other path for the life of the
-// process, and for Liked Songs the other path is the one that pages fifty at a
-// time, so recovering would cost more than the failure did. p.mu must be held.
 // adoptSnapshot reconciles a cached playlist with the snapshot_id the Web API
 // listing just reported. An entry carrying a revision was seeded by the client
 // protocol, which versions playlists differently, so its missing snapshot is
@@ -758,11 +747,21 @@ func adoptSnapshot(cache map[string]*playlistCache, playlistID, snapshotID strin
 	return false
 }
 
+// clearDeclinesLocked forgets which paths refused a playlist. The flags exist
+// to stop one read asking a refusing path once per page, so they are cleared
+// when a read starts: letting them outlive their read would let one transient
+// failure route every later read down the other path for the life of the
+// process, and for Liked Songs the other path is the one that pages fifty at a
+// time, so recovering would cost more than the failure did. p.mu must be held.
 func (p *SpotifyProvider) clearDeclinesLocked(playlistID string) {
 	delete(p.declinedByWeb, playlistID)
 	delete(p.declinedByClient, playlistID)
 }
 
+// clientDeclined and noteClientDeclined are the mirror of the two above, for
+// the lists the client protocol leads. Without them a failing resolve would be
+// retried once per page on the way to the Web API, which is the cost the Web
+// API's own stickiness exists to avoid.
 func (p *SpotifyProvider) clientDeclined(playlistID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -806,11 +805,6 @@ func (p *SpotifyProvider) cacheTracksLocked(playlistID string, tracks []playlist
 	p.trackCache[playlistID] = &playlistCache{tracks: tracks, total: total}
 }
 
-// savedTracksUnchanged revalidates a cached Liked Songs list with a single
-// limit=1 request. /v1/me/tracks ordering is undocumented but is empirically
-// added_at descending, so an unchanged total plus an unchanged newest entry
-// means no add or removal. If that ever stops holding the comparison simply
-// misses and we refetch, so the failure direction is stale-free.
 // savedTracksUnchangedClient answers the same question as savedTracksUnchanged
 // over the client protocol. The cached list is filled from a context resolve,
 // so proving it current with a resolve costs no Web API quota and keeps working
@@ -863,6 +857,11 @@ func (p *SpotifyProvider) savedTracksCurrent(ctx context.Context, tracks []playl
 	return p.savedTracksUnchanged(probeCtx, tracks, total)
 }
 
+// savedTracksUnchanged revalidates a cached Liked Songs list with a single
+// limit=1 request. /v1/me/tracks ordering is undocumented but is empirically
+// added_at descending, so an unchanged total plus an unchanged newest entry
+// means no add or removal. If that ever stops holding the comparison simply
+// misses and we refetch, so the failure direction is stale-free.
 func (p *SpotifyProvider) savedTracksUnchanged(ctx context.Context, tracks []playlist.Track, total int) bool {
 	resp, err := p.webAPI(ctx, "GET", "/v1/me/tracks", url.Values{"limit": {"1"}})
 	if err != nil {

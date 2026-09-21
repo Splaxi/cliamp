@@ -47,15 +47,3 @@ func (m apiMode) usesClient() bool { return m != apiModeWeb }
 // skipsWeb reports whether the Web API should be bypassed entirely, so that a
 // broken internal endpoint surfaces instead of being masked by a fallback.
 func (m apiMode) skipsWeb() bool { return m == apiModeClient }
-
-// String names the mode for logs.
-func (m apiMode) String() string {
-	switch m {
-	case apiModeClient:
-		return "client"
-	case apiModeWeb:
-		return "web"
-	default:
-		return "auto"
-	}
-}

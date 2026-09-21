@@ -30,36 +30,6 @@ func stubAddTrack(t *testing.T, calls *int) *SpotifyProvider {
 	return New(sess, "client", 320)
 }
 
-// The resolved URI list is a snapshot of the playlist taken when a read began.
-// Keeping it past the read would serve an edited playlist from stale contents,
-// and the snapshot pin could not tell, because the length it compares comes
-// from that same stale list. It now lives inside the accumulation, so ending
-// the read is what disposes of it.
-func TestResolvedURIsDoNotOutliveTheRead(t *testing.T) {
-	p := &SpotifyProvider{
-		trackCache:       map[string]*playlistCache{},
-		pending:          map[string]*pendingTracks{},
-		declinedByWeb:    map[string]bool{},
-		declinedByClient: map[string]bool{},
-	}
-
-	for _, name := range []string{"committed", "discarded"} {
-		t.Run(name, func(t *testing.T) {
-			p.pending["list"] = &pendingTracks{
-				want:  50,
-				total: 100,
-				uris:  []string{"spotify:track:a", "spotify:track:b"},
-			}
-
-			p.discardLoadLocked("list")
-
-			if pend, ok := p.pending["list"]; ok {
-				t.Errorf("the accumulation survived the read, still holding %d resolved URIs", len(pend.uris))
-			}
-		})
-	}
-}
-
 // A playlist this client just wrote to must drop its resolved URIs alongside
 // its cached tracks, or the next read would slice a list taken before the
 // write. Driven through the real write path rather than a copy of it.

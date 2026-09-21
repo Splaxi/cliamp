@@ -182,16 +182,12 @@ func TestApplyRevisionsDiscardsAnInFlightRead(t *testing.T) {
 	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{1})})
 
 	// A chain is midway through reading the list.
-	p.pending["a"] = &pendingTracks{total: 10, want: 5, tracks: make([]playlist.Track, 5)}
-	p.pending["a"] = &pendingTracks{want: 1, total: 1, uris: []string{"spotify:track:x"}}
+	p.pending["a"] = &pendingTracks{want: 1, total: 1, tracks: make([]playlist.Track, 1), uris: []string{"spotify:track:x"}}
 
 	p.applyRevisions([]rootlistEntry{revEntry("a", []byte{2})})
 
-	if p.pending["a"] != nil {
-		t.Error("the accumulation survived a revision change, so the next page would splice two snapshots")
-	}
 	if _, ok := p.pending["a"]; ok {
-		t.Error("the read, and the resolve it holds, survived a revision change")
+		t.Error("the accumulation, and the resolve it holds, survived a revision change")
 	}
 }
 

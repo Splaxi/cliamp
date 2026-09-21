@@ -66,7 +66,6 @@ func TestRateLimitIsReportedNotWaitedOut(t *testing.T) {
 			if elapsed > 10*time.Second {
 				t.Errorf("waited %v; a cooldown should be reported, not slept through", elapsed)
 			}
-			fmt.Printf("  %-28s requests=%d elapsed=%v err=%v\n", tc.name, requests, elapsed.Round(time.Millisecond), err)
 		})
 	}
 }
