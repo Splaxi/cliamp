@@ -984,6 +984,203 @@ func TestTracksRestartDropsTheResolveItWasHolding(t *testing.T) {
 	}
 }
 
+// The resume proof runs against one accumulation, but the probe is a request,
+// and a page-zero re-entry can replace that accumulation while the probe is in
+// flight. Adopting into the replacement hands it the prover's resolve -- taken
+// before whatever moved the library -- so the replacement's own pages and the
+// prover's continuation splice two snapshots into one committed list.
+func TestTracksPageDoesNotAdoptIntoAReplacedRead(t *testing.T) {
+	snapshot := "snap-1"
+	oldList := make([]string, 200)
+	newList := make([]string, 200)
+	for i := range oldList {
+		oldList[i] = fmt.Sprintf("spotify:track:p%d", i)
+		newList[i] = fmt.Sprintf("spotify:track:q%d", i)
+	}
+	list := oldList
+
+	probes := 0
+	var p *SpotifyProvider
+	originalTransport := http.DefaultTransport
+	http.DefaultTransport = roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		if req.URL.Path != "/v1/playlists/alpha" {
+			return nil, fmt.Errorf("unexpected Spotify API path %q", req.URL.Path)
+		}
+		probes++
+		if probes == 1 {
+			// The library moves while the prover's probe is in flight, and a
+			// third reader re-enters at page zero: its proof sees the moved
+			// snapshot and replaces the abandoned accumulation.
+			list, snapshot = newList, "snap-2"
+			if _, _, err := p.TracksPage("alpha", 0); err != nil {
+				t.Fatalf("replacing reader's page zero: %v", err)
+			}
+			// The probe itself left before the edit, so it answers with the
+			// snapshot it was asked about.
+			return jsonResponse(req, `{"snapshot_id":"snap-1"}`)
+		}
+		return jsonResponse(req, fmt.Sprintf(`{"snapshot_id":%q}`, snapshot))
+	})
+	t.Cleanup(func() { http.DefaultTransport = originalTransport })
+	sess := &Session{tokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "token"})}
+	p = New(sess, "client", 320)
+	p.apiMode = apiModeClient
+	p.trackCache["alpha"] = &playlistCache{snapshotID: "snap-1"}
+
+	serve := func(ctx context.Context, id string, off int, uris []string) (tracksPage, error) {
+		if uris == nil {
+			uris = list
+		}
+		page := tracksPage{total: len(uris), pageSize: 100, uris: uris}
+		for _, u := range uris[off:min(off+100, len(uris))] {
+			page.tracks = append(page.tracks, playlist.Track{Path: u})
+		}
+		return page, nil
+	}
+	p.clientPage = serve
+
+	// Read one takes page zero on the old snapshot and is abandoned mid-load.
+	if _, next, err := p.TracksPage("alpha", 0); err != nil || next != 100 {
+		t.Fatalf("page zero: next=%d err=%v", next, err)
+	}
+
+	// Read two re-enters; its probe passes against the old snapshot, but the
+	// accumulation it proved against has been replaced by the time it lands.
+	page, next, err := p.TracksPage("alpha", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next != 100 {
+		t.Fatalf("read two resumed at %d, want 100", next)
+	}
+	// Whatever chain is standing must be uniform: read two either adopted the
+	// accumulation it proved against or restarted its own. Serving the
+	// replacement's tracks with the prover's resolve is the splice.
+	if page[0].Path != "spotify:track:p0" {
+		t.Fatalf("read two was served the replacement's head %s with a resolve from before the edit", page[0].Path)
+	}
+
+	// The standing chain runs to completion and commits.
+	for next != 0 {
+		if _, next, err = p.TracksPage("alpha", next); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cached := p.trackCache["alpha"]
+	if cached == nil || len(cached.tracks) != 200 {
+		t.Fatalf("committed %v tracks, want 200", cached)
+	}
+	for i, tr := range cached.tracks {
+		if want := fmt.Sprintf("spotify:track:p%d", i); tr.Path != want {
+			t.Fatalf("committed list spliced at [%d]: got %s among p*, want a list from one snapshot", i, tr.Path)
+		}
+	}
+}
+
+// Two readers can hold the same continuation page in flight at once -- two
+// daemon connections paging one list in lockstep. Both capture the same
+// accumulation and slice the same page from it; the first to land advances the
+// offset the accumulation wants, so the second must be served to its caller
+// without being accumulated, or its page is appended a second time and the
+// committed list grows duplicates.
+func TestTracksPageIgnoresADuplicateContinuation(t *testing.T) {
+	uris := make([]string, 300)
+	for i := range uris {
+		uris[i] = fmt.Sprintf("spotify:track:t%d", i)
+	}
+
+	sess := &Session{tokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "token"})}
+	p := New(sess, "client", 320)
+	p.apiMode = apiModeClient
+	raced := false
+	p.clientPage = func(ctx context.Context, id string, off int, carried []string) (tracksPage, error) {
+		if carried == nil {
+			carried = uris
+		}
+		if off == 100 && !raced {
+			// A second reader asks for the same page while the first is in
+			// flight, and lands first.
+			raced = true
+			if _, _, err := p.TracksPage(id, 100); err != nil {
+				t.Fatalf("racing continuation: %v", err)
+			}
+		}
+		page := tracksPage{total: len(carried), pageSize: 100, uris: carried}
+		for _, u := range carried[off:min(off+100, len(carried))] {
+			page.tracks = append(page.tracks, playlist.Track{Path: u})
+		}
+		return page, nil
+	}
+
+	if _, next, err := p.TracksPage("alpha", 0); err != nil || next != 100 {
+		t.Fatalf("page zero: next=%d err=%v", next, err)
+	}
+	// This continuation's twin has already landed inside the fetch above.
+	if _, next, err := p.TracksPage("alpha", 100); err != nil || next != 200 {
+		t.Fatalf("continuation: next=%d err=%v", next, err)
+	}
+
+	pend := p.pending["alpha"]
+	if pend == nil {
+		t.Fatal("the accumulation vanished mid-load")
+	}
+	if len(pend.tracks) != 200 || pend.want != 200 {
+		t.Fatalf("accumulation holds %d tracks at want %d, want 200 at 200: a page already landed was accumulated twice",
+			len(pend.tracks), pend.want)
+	}
+	seen := map[string]int{}
+	for _, tr := range pend.tracks {
+		seen[tr.Path]++
+	}
+	for uri, n := range seen {
+		if n != 1 {
+			t.Fatalf("%s appears %d times in the accumulation", uri, n)
+		}
+	}
+}
+
+// A resume keeps paying for the remaining pages with the resolve the proof just
+// validated, not the one the abandoned read was holding: the proof describes
+// the library now, and only that resolve is known to agree with it.
+func TestAResumedReadCarriesTheFreshResolveForward(t *testing.T) {
+	sess := &Session{tokenSource: oauth2.StaticTokenSource(&oauth2.Token{AccessToken: "token"})}
+	p := New(sess, "client", 320)
+	p.apiMode = apiModeClient
+	fresh := make([]string, 200)
+	for i := range fresh {
+		fresh[i] = fmt.Sprintf("spotify:track:f%d", i)
+	}
+	p.clientPage = func(ctx context.Context, id string, off int, uris []string) (tracksPage, error) {
+		if uris == nil {
+			uris = fresh
+		}
+		page := tracksPage{total: len(uris), pageSize: 100, uris: uris}
+		for _, u := range uris[off:min(off+100, len(uris))] {
+			page.tracks = append(page.tracks, playlist.Track{Path: u})
+		}
+		return page, nil
+	}
+
+	if _, next, err := p.TracksPage("YOUR MUSIC", 0); err != nil || next != 100 {
+		t.Fatalf("page zero: next=%d err=%v", next, err)
+	}
+	// Stand in for the resolve the abandoned chain was reading from.
+	p.mu.Lock()
+	p.pending["YOUR MUSIC"].uris = []string{"spotify:track:stale"}
+	p.mu.Unlock()
+
+	if _, next, err := p.TracksPage("YOUR MUSIC", 0); err != nil || next != 100 {
+		t.Fatalf("resume: next=%d err=%v", next, err)
+	}
+	p.mu.Lock()
+	pend := p.pending["YOUR MUSIC"]
+	held := pend.uris
+	p.mu.Unlock()
+	if len(held) != len(fresh) || held[0] != fresh[0] {
+		t.Fatalf("the resumed read is slicing %v, want the resolve its proof validated", held)
+	}
+}
+
 // A read slices every page from the snapshot it started with. Before the
 // resolve belonged to the read, it sat in a map keyed by playlist, so a second
 // reader of the same list -- reachable in daemon mode, where each IPC
