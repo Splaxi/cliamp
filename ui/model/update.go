@@ -424,6 +424,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, cmd
 
 	case trackRadioMsg:
+		// Whatever became of it, this request is over, so W is free again --
+		// including when it was superseded, or the key would stay locked.
+		m.trackRadio.starting = false
 		if msg.gen != m.requests.tracks || !m.isActiveProvider(msg.providerName) {
 			return m, nil
 		}
@@ -437,6 +440,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status.Warningf(statusTTLDefault, "Radio came back empty")
 			return m, nil
 		}
+		// Only a station that actually starts spends the interval: one that
+		// failed or came back empty opened no tracks, so retrying costs nothing.
+		m.trackRadio.lastStart = time.Now()
 		// A station is a fresh queue rather than an addition: the point is to
 		// leave what you were listening to and follow the seed instead.
 		m.replacePlayerPlaylist(msg.tracks)

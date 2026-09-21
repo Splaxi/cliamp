@@ -72,7 +72,7 @@ When focused on the provider panel:
 
 After you load a playlist, Cliamp returns to the standard playlist view. Use the usual controls for seek, volume, EQ, shuffle, repeat, queue, search, and lyrics.
 
-With the playlist in focus, press `W` on a track to start its Spotify radio: the station Spotify builds from that song. It replaces the queue and starts playing.
+With the playlist in focus, press `W` on a track to start its Spotify radio: the station Spotify builds from that song. It replaces the queue and starts playing. A new station can start at most once every 10 seconds, because starting one opens its first tracks straight away and Spotify refuses playback when too many tracks are opened within a minute. Moving through a station that is already playing is not limited.
 
 Large playlists fill in as they load. Cliamp shows the first tracks, appends the remaining pages in the background, and stays usable while the list arrives.
 
