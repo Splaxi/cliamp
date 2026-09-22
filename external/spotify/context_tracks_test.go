@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/bjarneo/cliamp/playlist"
+	metadatapb "github.com/devgianlu/go-librespot/proto/spotify/metadata"
 	"golang.org/x/oauth2"
 )
 
@@ -52,5 +53,58 @@ func TestInvalidationDropsResolvedURIs(t *testing.T) {
 	}
 	if _, ok := p.trackCache["list"]; ok {
 		t.Error("cached tracks outlived a write to the playlist")
+	}
+}
+
+func metadataImage(id byte, size metadatapb.Image_Size) *metadatapb.Image {
+	return &metadatapb.Image{FileId: []byte{0xab, id}, Size: size.Enum()}
+}
+
+// A track read through the client protocol must carry the same cover the Web
+// API path would pick, or Liked Songs and refused playlists lose their art.
+func TestCoverFromMetadata(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		album *metadatapb.Album
+		want  string
+	}{
+		{
+			"picks the 300px size, like the Web API path",
+			&metadatapb.Album{CoverGroup: &metadatapb.ImageGroup{Image: []*metadatapb.Image{
+				metadataImage(1, metadatapb.Image_SMALL),
+				metadataImage(2, metadatapb.Image_DEFAULT),
+				metadataImage(3, metadatapb.Image_LARGE),
+			}}},
+			"https://i.scdn.co/image/ab02",
+		},
+		{
+			"falls back to the older cover list",
+			&metadatapb.Album{Cover: []*metadatapb.Image{metadataImage(4, metadatapb.Image_DEFAULT)}},
+			"https://i.scdn.co/image/ab04",
+		},
+		{
+			"largest when nothing reaches 300px",
+			&metadatapb.Album{CoverGroup: &metadatapb.ImageGroup{Image: []*metadatapb.Image{
+				metadataImage(5, metadatapb.Image_SMALL),
+			}}},
+			"https://i.scdn.co/image/ab05",
+		},
+		{"no art at all", &metadatapb.Album{}, ""},
+		{"no album", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := coverFromMetadata(tc.album); got != tc.want {
+				t.Errorf("cover = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTrackFromMetadataCarriesAlbumArt(t *testing.T) {
+	tr := &metadatapb.Track{Album: &metadatapb.Album{CoverGroup: &metadatapb.ImageGroup{
+		Image: []*metadatapb.Image{metadataImage(2, metadatapb.Image_DEFAULT)},
+	}}}
+	if got := trackFromMetadata("spotify:track:x", tr).AlbumArtURL; got != "https://i.scdn.co/image/ab02" {
+		t.Errorf("AlbumArtURL = %q, want the album's cover", got)
 	}
 }

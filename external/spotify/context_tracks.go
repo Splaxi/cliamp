@@ -2,6 +2,7 @@ package spotify
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -115,6 +116,45 @@ func (p *SpotifyProvider) trackMetadata(ctx context.Context, uris []string) ([]p
 // entry, populating the same fields trackFromItem does from the Web API's
 // shape. Duration arrives in milliseconds, artists as a list, and the year on
 // the album rather than as a release-date string.
+// spotifyImageHost serves cover art by file id. The Web API's image URLs are
+// this host plus the same id in hex, which is how metadata names an image.
+const spotifyImageHost = "https://i.scdn.co/image/"
+
+// metadataImageWidth is the width Spotify renders each metadata size class at,
+// for images that do not state their own.
+var metadataImageWidth = map[metadatapb.Image_Size]int{
+	metadatapb.Image_SMALL:   64,
+	metadatapb.Image_DEFAULT: 300,
+	metadatapb.Image_LARGE:   640,
+	metadatapb.Image_XLARGE:  1280,
+}
+
+// coverFromMetadata picks a track's album art from metadata the same way the
+// Web API path picks it from images, so a track shows the same cover whichever
+// path read it.
+func coverFromMetadata(album *metadatapb.Album) string {
+	sources := album.GetCoverGroup().GetImage()
+	if len(sources) == 0 {
+		sources = album.GetCover()
+	}
+	images := make([]spotifyImage, 0, len(sources))
+	for _, img := range sources {
+		if len(img.GetFileId()) == 0 {
+			continue
+		}
+		width := int(img.GetWidth())
+		if width == 0 {
+			width = metadataImageWidth[img.GetSize()]
+		}
+		images = append(images, spotifyImage{
+			URL:    spotifyImageHost + hex.EncodeToString(img.GetFileId()),
+			Width:  width,
+			Height: int(img.GetHeight()),
+		})
+	}
+	return pickCoverImage(images)
+}
+
 func trackFromMetadata(uri string, tr *metadatapb.Track) playlist.Track {
 	names := make([]string, 0, len(tr.GetArtist()))
 	for _, a := range tr.GetArtist() {
@@ -128,6 +168,7 @@ func trackFromMetadata(uri string, tr *metadatapb.Track) playlist.Track {
 		Artist:       strings.Join(names, ", "),
 		Album:        tr.GetAlbum().GetName(),
 		Year:         int(tr.GetAlbum().GetDate().GetYear()),
+		AlbumArtURL:  coverFromMetadata(tr.GetAlbum()),
 		DurationSecs: int(tr.GetDuration()) / 1000,
 		TrackNumber:  int(tr.GetNumber()),
 		Stream:       false,
