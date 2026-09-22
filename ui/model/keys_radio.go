@@ -180,9 +180,11 @@ func (m Model) playlistTrackStarred(track playlist.Track) bool {
 
 // radioInterval is the least time between two stations starting. Starting one
 // is the expensive action: it asks for the station, then opens its first track
-// and preloads the second straight away, and Spotify refuses audio keys once
-// roughly thirty track opens land inside a minute. Moving through a station
-// that is already playing costs one open per track and is not limited.
+// and preloads the second straight away, and Spotify refuses audio keys when
+// track opens come too fast for too long -- as few as twenty in a minute after
+// sustained use. Moving through a station that is already playing costs one
+// open per track and is not limited. The interval is held in memory, so it
+// restarts with cliamp.
 const radioInterval = 10 * time.Second
 
 // trackRadioState keeps a station request from overlapping another, and
@@ -208,6 +210,7 @@ func (m *Model) startTrackRadio() tea.Cmd {
 	// A held key repeats, and nothing upstream filters that, so without this
 	// every repeat would be a request of its own.
 	if m.trackRadio.starting {
+		m.status.Activityf(statusTTLDefault, "Radio is still starting…")
 		return nil
 	}
 	if wait := radioInterval - time.Since(m.trackRadio.lastStart); wait > 0 {
