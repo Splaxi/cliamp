@@ -120,7 +120,7 @@ func parseRootlist(content *playlist4pb.SelectedListContent) ([]rootlistEntry, e
 }
 
 // parseGroupStart splits a start-group URI into its id and display name. The
-// name is URL-encoded with spaces as "+", so "My+love+%3C3" is "My love <3".
+// name is URL-encoded with spaces as "+", so "Late+Night+%26+Chill" is "Late Night & Chill".
 func parseGroupStart(uri string) (id, name string) {
 	rest := strings.TrimPrefix(uri, rootlistGroupStart)
 	id, encoded, found := strings.Cut(rest, ":")
