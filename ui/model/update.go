@@ -446,6 +446,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// A station is a fresh queue rather than an addition: the point is to
 		// leave what you were listening to and follow the seed instead.
 		m.replacePlayerPlaylist(msg.tracks)
+		// The queue is a station now, not the playlist that was loaded.
+		m.activeProviderPlaylistID = ""
 		m.playlist.SetIndex(0)
 		m.plCursor = 0
 		m.adjustScroll()

@@ -123,3 +123,22 @@ func TestRadioRequestFreesTheKeyHoweverItEnds(t *testing.T) {
 		})
 	}
 }
+
+// A station replaces the loaded playlist, so that playlist must stop being the
+// active one, or it stays highlighted and queue refreshes treat it as current.
+func TestRadioClearsTheActivePlaylist(t *testing.T) {
+	m := radioTestModel(t)
+	m.activeProviderPlaylistID = "loaded-playlist"
+	if pressRadio(&m) == nil {
+		t.Fatal("the press did not ask for a station")
+	}
+	next, _ := m.Update(trackRadioMsg{
+		seed:         playlist.Track{Path: "spotify:track:seed"},
+		tracks:       []playlist.Track{{Path: "spotify:track:r1"}},
+		providerName: "Spotify",
+		gen:          m.requests.tracks,
+	})
+	if got := next.(Model).activeProviderPlaylistID; got != "" {
+		t.Errorf("active playlist = %q after a station replaced it, want none", got)
+	}
+}

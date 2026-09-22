@@ -1135,6 +1135,13 @@ func retryAfter(h http.Header) time.Duration {
 	}
 	secs, err := strconv.Atoi(v)
 	if err != nil || secs <= 0 {
+		// RFC 9110 also allows an HTTP-date. Read as zero, it looked like no
+		// wait at all and the caller retried after a second.
+		if when, derr := http.ParseTime(v); derr == nil {
+			if d := time.Until(when); d > 0 {
+				return d
+			}
+		}
 		return 0
 	}
 	return time.Duration(secs) * time.Second

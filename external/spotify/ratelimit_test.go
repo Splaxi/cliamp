@@ -99,3 +99,17 @@ func TestWebAPIIsAskedOncePerRead(t *testing.T) {
 		t.Errorf("asked the web api %d times for one read; it refused on the first", webCalls)
 	}
 }
+
+// RFC 9110 allows Retry-After as an HTTP-date as well as seconds. Read as
+// zero, a date looked like no wait at all.
+func TestRetryAfterReadsAnHTTPDate(t *testing.T) {
+	h := http.Header{}
+	h.Set("Retry-After", time.Now().Add(90*time.Second).UTC().Format(http.TimeFormat))
+	if got := retryAfter(h); got < 80*time.Second || got > 91*time.Second {
+		t.Errorf("retryAfter(date 90s ahead) = %v, want about 90s", got)
+	}
+	h.Set("Retry-After", time.Now().Add(-time.Minute).UTC().Format(http.TimeFormat))
+	if got := retryAfter(h); got != 0 {
+		t.Errorf("retryAfter(past date) = %v, want 0", got)
+	}
+}

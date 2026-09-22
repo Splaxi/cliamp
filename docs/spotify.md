@@ -106,7 +106,7 @@ Track counts beside folder-grouped playlists come from Spotify's own library lis
 
 A playlist read through the client protocol serves songs only: podcast episodes and your own local files ride in the same list but cannot be played from there, so they are skipped. In `auto` this affects only playlists the Web API refused, which previously showed nothing at all.
 
-The client protocol is undocumented and can change without notice, which is why every path falls back to the Web API and why `web` exists as an escape hatch.
+The client protocol is undocumented and can change without notice, which is why `auto` falls back to the Web API wherever it can and why `web` exists as an escape hatch. `client` deliberately does not fall back.
 
 ## Troubleshooting
 
