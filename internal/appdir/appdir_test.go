@@ -30,6 +30,15 @@ func TestDir(t *testing.T) {
 			env:         map[string]string{"CLIAMP_CONFIG_DIR": "", "XDG_CONFIG_HOME": "", "HOME": "", "APPDATA": "TEMPDIR"},
 			want:        func(tmp string) string { return filepath.Join(tmp, "cliamp") },
 		},
+		{
+			// Plugin children receive a synthesized HOME (see
+			// luaplugin/minimalExecEnv); on Windows they must still
+			// resolve to APPDATA so they find the daemon socket.
+			name:        "appdata on windows wins over home",
+			windowsOnly: true,
+			env:         map[string]string{"CLIAMP_CONFIG_DIR": "", "XDG_CONFIG_HOME": "", "HOME": "/some/home", "APPDATA": "TEMPDIR"},
+			want:        func(tmp string) string { return filepath.Join(tmp, "cliamp") },
+		},
 	}
 
 	for _, tt := range tests {
