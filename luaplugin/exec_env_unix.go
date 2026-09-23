@@ -4,6 +4,9 @@ package luaplugin
 
 import "os"
 
+// minimalExecEnv returns the restricted environment for plugin subprocesses:
+// PATH, HOME and LANG, plus any explicit cliamp config overrides so a
+// `cliamp remote call` child resolves the same config dir as the daemon.
 func minimalExecEnv() []string {
 	path := os.Getenv("PATH")
 	if path == "" {

@@ -1,6 +1,7 @@
 package appdir
 
 import (
+	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -64,6 +65,51 @@ func TestDir(t *testing.T) {
 				t.Fatalf("Dir() = %q, want %q", got, want)
 			}
 		})
+	}
+}
+
+// TestDirWindowsLegacyFallback covers the upgrade path: a Windows user whose
+// config lives in the pre-fix HOME/.config/cliamp location keeps resolving
+// there while APPDATA/cliamp has no config yet; once APPDATA has one, it wins.
+func TestDirWindowsLegacyFallback(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows-specific fallback")
+	}
+	appData := t.TempDir()
+	home := t.TempDir()
+	legacy := filepath.Join(home, ".config", "cliamp")
+	if err := os.MkdirAll(legacy, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(legacy, "config.toml"), []byte("[plugins]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLIAMP_CONFIG_DIR", "")
+	t.Setenv("XDG_CONFIG_HOME", "")
+	t.Setenv("APPDATA", appData)
+	t.Setenv("HOME", home)
+
+	got, err := Dir()
+	if err != nil {
+		t.Fatalf("Dir() error: %v", err)
+	}
+	if got != legacy {
+		t.Fatalf("Dir() = %q, want legacy %q", got, legacy)
+	}
+
+	// Once the canonical location has a config, it takes precedence.
+	if err := os.MkdirAll(filepath.Join(appData, "cliamp"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(appData, "cliamp", "config.toml"), []byte("[plugins]\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got, err = Dir()
+	if err != nil {
+		t.Fatalf("Dir() error: %v", err)
+	}
+	if want := filepath.Join(appData, "cliamp"); got != want {
+		t.Fatalf("Dir() = %q, want %q", got, want)
 	}
 }
 
