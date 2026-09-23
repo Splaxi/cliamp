@@ -28,7 +28,7 @@ func Dir() (string, error) {
 	if runtime.GOOS == "windows" {
 		if appData, ok := os.LookupEnv("APPDATA"); ok && appData != "" {
 			appDir := filepath.Join(appData, "cliamp")
-			if _, err := os.Stat(filepath.Join(appDir, "config.toml")); err != nil {
+			if _, err := os.Stat(filepath.Join(appDir, "config.toml")); os.IsNotExist(err) {
 				if legacy := legacyWindowsDir(); legacy != "" && legacy != appDir {
 					if _, lerr := os.Stat(filepath.Join(legacy, "config.toml")); lerr == nil {
 						return legacy, nil
