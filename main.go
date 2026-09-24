@@ -71,6 +71,36 @@ func isBufferedProviderURL(u string) bool {
 		yandex.IsStreamURL(u)
 }
 
+func restoreJellyfinContext(state resume.State, prov *jellyfin.Provider) ([]playlist.Track, int, string, bool) {
+	if prov == nil || len(state.Context) == 0 {
+		return nil, 0, "", false
+	}
+	index := state.ContextIndex
+	if index < 0 || index >= len(state.Context) || state.Context[index].Path != state.Path {
+		index = -1
+		for i, track := range state.Context {
+			if track.Path == state.Path {
+				index = i
+				break
+			}
+		}
+	}
+	if index < 0 {
+		return nil, 0, "", false
+	}
+	if _, ok := prov.RestoreTrack(state.Context[index]); !ok {
+		return nil, 0, "", false
+	}
+
+	tracks := append([]playlist.Track(nil), state.Context...)
+	for i, track := range tracks {
+		if restored, ok := prov.RestoreTrack(track); ok {
+			tracks[i] = restored
+		}
+	}
+	return tracks, index, tracks[index].Path, true
+}
+
 func run(overrides config.Overrides, positional []string, daemon, visualizer60FPS bool) error {
 	cfg, err := config.Load()
 	if err != nil {
@@ -88,7 +118,9 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 	}
 
 	// Public providers are always available; account providers register when configured.
+	radioFavorites := radio.LoadFavorites()
 	radioProv := radio.New(radio.Options{
+		Favorites:   radioFavorites,
 		Country:     cfg.Radio.Country,
 		SaveCountry: config.SaveRadioCountry,
 	})
@@ -99,12 +131,15 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 	if localProv != nil {
 		providers = append(providers, model.ProviderEntry{Key: "local", Name: "Local", Provider: localProv})
 	}
-	providers = append(providers, model.ProviderEntry{Key: "podcast", Name: "Podcasts", Provider: podcast.New(cfg.Podcast.Country)})
+	podcastProv := podcast.New(cfg.Podcast.Country)
+	// Flush per-episode listening state that the throttled writer still holds.
+	defer podcastProv.Close()
+	providers = append(providers, model.ProviderEntry{Key: "podcast", Name: "Podcasts", Provider: podcastProv})
 
 	var navClient *navidrome.NavidromeClient
 	if c := navidrome.NewFromConfig(cfg.Navidrome); c != nil {
 		navClient = c
-	} else if c := navidrome.NewFromEnv(); c != nil {
+	} else if c := navidrome.NewFromEnv(cfg.Navidrome); c != nil {
 		navClient = c
 	}
 	if navClient != nil {
@@ -125,7 +160,9 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 		providers = append(providers, model.ProviderEntry{Key: "plex", Name: "Plex", Provider: plexProv})
 	}
 
-	if jellyProv := jellyfin.NewFromConfig(cfg.Jellyfin); jellyProv != nil {
+	var jellyProv *jellyfin.Provider
+	if p := jellyfin.NewFromConfig(cfg.Jellyfin); p != nil {
+		jellyProv = p
 		providers = append(providers, model.ProviderEntry{Key: "jellyfin", Name: "Jellyfin", Provider: jellyProv})
 	}
 
@@ -295,6 +332,7 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 		defaultProvider = "radio"
 	}
 	defaultRadio := len(positional) == 0 && defaultProvider == "radio"
+	resumeState := resume.Load()
 
 	pl := playlist.New()
 	if cfg.Playlist != "" && localProv != nil {
@@ -313,6 +351,18 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 		resolved.Pending = append(resolved.Pending, radio.BuiltinURL)
 	}
 	pl.Add(resolved.Tracks...)
+
+	restoredJellyfinChoice := false
+	restoredJellyfinIndex := 0
+	restoredResumePath := ""
+	if !daemon && defaultProvider == "jellyfin" && jellyProv != nil && cfg.Playlist == "" && len(positional) == 0 && len(resolved.Pending) == 0 && pl.Len() == 0 {
+		if tracks, index, activePath, ok := restoreJellyfinContext(resumeState, jellyProv); ok {
+			pl.Add(tracks...)
+			restoredJellyfinChoice = true
+			restoredJellyfinIndex = index
+			restoredResumePath = activePath
+		}
+	}
 
 	// Daemon mode has no UI loop to drain pending URLs (feeds, M3U, yt-dlp),
 	// so resolve them synchronously here. The TUI path does this in the
@@ -383,6 +433,16 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 		})
 	}
 
+	if jellyProv != nil {
+		// Refresh restored Jellyfin URLs without changing logical playlist paths.
+		for _, scheme := range []string{"http://", "https://"} {
+			p.RegisterSourceResolver(scheme, func(rawURL string) (player.ResolvedSource, error) {
+				u, err := jellyProv.ResolveSource(rawURL)
+				return player.ResolvedSource{URL: u}, err
+			})
+		}
+	}
+
 	p.RegisterBufferedURLMatcher(isBufferedProviderURL)
 
 	// Pull now-playing for stations that carry no inline ICY metadata (NTS, FIP).
@@ -418,6 +478,21 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 	}
 
 	m := model.New(p, pl, providers, defaultProvider, localProv, themes, luaMgr, config.SaveFunc{})
+	m.SetRadioFavorites(radioFavorites)
+	if defaultProvider == "jellyfin" && jellyProv != nil {
+		m.SetResumeSaver(func(track playlist.Track, positionSec int, context []playlist.Track, contextIndex int) {
+			if _, ok := jellyProv.RestoreTrack(track); !ok {
+				return
+			}
+			resume.SaveState(resume.State{
+				Path: track.Path, PositionSec: positionSec,
+				Context: context, ContextIndex: contextIndex,
+			})
+		})
+	}
+	if restoredJellyfinChoice {
+		m.SetInitialTrack(restoredJellyfinIndex)
+	}
 	m.SetIPCBroker(pluginBroker)
 	m.SetCustomEQBands(cfg.EQ)
 	m.SetVisVolumeLinked(cfg.VisVolumeLinked)
@@ -454,6 +529,7 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 			TrackDuration: func() int { t, _ := pl.Current(); return t.DurationSecs },
 			PlaylistCount: func() int { return pl.Len() },
 			CurrentIndex:  func() int { return pl.Index() },
+			HasNext:       pl.HasNext,
 			QueueList: func() []luaplugin.QueueEntry {
 				tracks := pl.Tracks()
 				out := make([]luaplugin.QueueEntry, len(tracks))
@@ -464,7 +540,7 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 						Album:  t.Album,
 						Path:   t.Path,
 						Index:  i,
-						Queued: pl.QueuePosition(i) >= 0,
+						Queued: pl.QueuePosition(i) > 0, // 1-based; 0 means not queued
 					}
 				}
 				return out
@@ -479,7 +555,9 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 	}
 
 	m.SetSeekStepLarge(cfg.SeekStepLargeDuration())
+	m.SetLyricsOffset(cfg.LyricsOffsetMs)
 	m.SetInitialDirectory(cfg.InitialDirectory)
+	m.SetDownloadsDirectory(cfg.Downloads.Directory)
 	m.SetPendingURLs(resolved.Pending)
 	if cfg.Playlist != "" && len(resolved.Tracks) == 0 && len(resolved.Pending) == 0 {
 		m.SetLoadedPlaylist(cfg.Playlist)
@@ -496,7 +574,7 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 	if cfg.Visualizer != "" {
 		m.SetVisualizer(cfg.Visualizer)
 	}
-	if cfg.AutoPlay {
+	if cfg.AutoPlay && !restoredJellyfinChoice {
 		m.SetAutoPlay(true)
 	}
 	if cfg.LowPower {
@@ -514,13 +592,19 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 	if cfg.ShowMetadata {
 		m.SetShowMetadata(true)
 	}
+	if cfg.Expanded {
+		m.SetExpanded(true)
+	}
 
-	if rs := resume.Load(); rs.Path != "" && rs.PositionSec > 0 {
-		// Mixcloud is commonly opened from its provider browser rather than a
-		// positional URL. Arm only that provider's browser-started resume while
-		// preserving cliamp's existing positional-file behavior elsewhere.
-		if playlist.IsMixcloudURL(rs.Path) || (!defaultRadio && len(positional) > 0) {
-			m.SetResume(rs.Path, rs.PositionSec)
+	if resumeState.Path != "" && resumeState.PositionSec > 0 {
+		// Jellyfin resumes the restored context above. Mixcloud is also commonly
+		// opened from its provider browser rather than a positional URL; preserve
+		// cliamp's existing positional-file behavior for other providers.
+		switch {
+		case restoredResumePath != "":
+			m.SetResume(restoredResumePath, resumeState.PositionSec)
+		case playlist.IsMixcloudURL(resumeState.Path) || (!defaultRadio && len(positional) > 0):
+			m.SetResume(resumeState.Path, resumeState.PositionSec)
 		}
 	}
 
@@ -562,10 +646,10 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 			SetSpeed:    func(ratio float64) { p.SetSpeed(ratio) },
 			SetEQBand:   func(band int, db float64) { prog.Send(model.SetEQBandMsg{Band: band, Gain: db}) },
 			ToggleMono:  func() { p.ToggleMono() },
-			TogglePause: func() { p.TogglePause() },
-			Stop:        func() { p.Stop() },
+			TogglePause: func() { prog.Send(playback.PlayPauseMsg{}) },
+			Stop:        func() { prog.Send(playback.StopMsg{}) },
 			Seek: func(secs float64) {
-				_ = p.Seek(time.Duration(secs * float64(time.Second)))
+				prog.Send(playback.SeekMsg{Offset: time.Duration(secs * float64(time.Second))})
 			},
 			SetEQPreset: func(name string, bands *[10]float64) {
 				prog.Send(model.SetEQPresetMsg{Name: name, Bands: bands})
@@ -618,8 +702,16 @@ func run(overrides config.Overrides, positional []string, daemon, visualizer60FP
 		}
 		_ = config.Save("theme", fmt.Sprintf("%q", themeName))
 
-		if path, secs, pl := fm.ResumeState(); path != "" && secs > 0 {
-			resume.Save(path, secs, pl)
+		if path, secs, playlistName := fm.ResumeState(); path != "" && secs > 0 {
+			if defaultProvider == "jellyfin" && jellyfin.IsStreamURL(path) {
+				context, index := fm.ResumeContext()
+				resume.SaveState(resume.State{
+					Path: path, PositionSec: secs, Playlist: playlistName,
+					Context: context, ContextIndex: index,
+				})
+			} else {
+				resume.Save(path, secs, playlistName)
+			}
 		}
 	}
 

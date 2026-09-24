@@ -407,6 +407,42 @@ func TestSpotifyResolveClientID(t *testing.T) {
 	}
 }
 
+func TestLoadLyricsOffsetMs(t *testing.T) {
+	tests := []struct {
+		name string
+		val  string
+		want int
+	}{
+		{"unset defaults to zero", "", 0},
+		{"positive value", "lyrics_offset_ms = 1500", 1500},
+		{"negative value", "lyrics_offset_ms = -500", -500},
+		{"out of range clamped", "lyrics_offset_ms = 20000", 10000},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+
+			path := filepath.Join(os.Getenv("HOME"), ".config", "cliamp", "config.toml")
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			if tt.val != "" {
+				if err := os.WriteFile(path, []byte(tt.val+"\n"), 0o644); err != nil {
+					t.Fatalf("WriteFile: %v", err)
+				}
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.LyricsOffsetMs != tt.want {
+				t.Fatalf("LyricsOffsetMs = %d, want %d", cfg.LyricsOffsetMs, tt.want)
+			}
+		})
+	}
+}
+
 func TestLoadSpotifyBitrate(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -867,6 +903,79 @@ func TestApplyPlaylist(t *testing.T) {
 			}
 			if pl.shuffled != tt.wantShuffle {
 				t.Errorf("shuffled = %v, want %v", pl.shuffled, tt.wantShuffle)
+			}
+		})
+	}
+}
+
+func TestLoadExpanded(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+		want bool
+	}{
+		{name: "true", body: "expanded = true\n", want: true},
+		{name: "mixed case", body: "expanded = True\n", want: true},
+		{name: "false", body: "expanded = false\n", want: false},
+		{name: "absent", body: "visualizer = \"Wave\"\n", want: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+
+			path := filepath.Join(os.Getenv("HOME"), ".config", "cliamp", "config.toml")
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			if err := os.WriteFile(path, []byte(tc.body), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.Expanded != tc.want {
+				t.Errorf("Expanded = %v, want %v", cfg.Expanded, tc.want)
+			}
+		})
+	}
+}
+
+func TestOverridesApplyExpanded(t *testing.T) {
+	cfg := defaultConfig()
+	expanded := true
+	Overrides{Expanded: &expanded}.Apply(&cfg)
+	if !cfg.Expanded {
+		t.Error("Expanded should be true after applying the override")
+	}
+}
+
+func TestLoadNavidromeFormat(t *testing.T) {
+	tests := []struct {
+		name string
+		body string
+		want string
+	}{
+		{"absent", "[navidrome]\nurl = \"https://e.com\"\nuser = \"a\"\npassword = \"b\"\n", ""},
+		{"raw", "[navidrome]\nurl = \"https://e.com\"\nuser = \"a\"\npassword = \"b\"\nformat = \"raw\"\n", "raw"},
+		{"mp3", "[navidrome]\nurl = \"https://e.com\"\nuser = \"a\"\npassword = \"b\"\nformat = \"mp3\"\n", "mp3"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			path := filepath.Join(os.Getenv("HOME"), ".config", "cliamp", "config.toml")
+			if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+				t.Fatalf("MkdirAll: %v", err)
+			}
+			if err := os.WriteFile(path, []byte(tt.body), 0o644); err != nil {
+				t.Fatalf("WriteFile: %v", err)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load() error = %v", err)
+			}
+			if cfg.Navidrome.Format != tt.want {
+				t.Errorf("Navidrome.Format = %q, want %q", cfg.Navidrome.Format, tt.want)
 			}
 		})
 	}

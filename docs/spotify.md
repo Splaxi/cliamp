@@ -36,7 +36,7 @@ Run `cliamp`, select Spotify, and press Enter to sign in. With your own `client_
 
 Spotify introduced the current Development Mode restrictions for new apps on February 11, 2026. It migrated existing Development Mode apps on March 9, 2026. Extended Quota Mode apps are not affected. See the Spotify [February 2026 migration guide](https://developer.spotify.com/documentation/web-api/tutorials/february-2026-migration-guide) for the full timeline.
 
-Search remains available in Development Mode, but `/v1/search` accepts at most **10 results per request**. A larger request returns `400 "Invalid limit"`. This does not mean search is blocked. Cliamp uses `offset` to page results in groups of 10. <kbd>Ctrl+F</kbd> returns the full result set.
+Search remains available in Development Mode, but `/v1/search` accepts at most **10 results per request**. A larger request returns `400 "Invalid limit"`. This does not mean search is blocked. Cliamp uses `offset` to page results in groups of 10. <kbd>Ctrl+F</kbd> asks for 20 results of each kind — albums, tracks, and episodes — so a Development Mode app fetches them as two pages of 10.
 
 Other Development Mode changes remove endpoints such as `/v1/browse/new-releases`. They restrict playlist items to playlists the user owns or collaborates on. `/v1/search` remains available and does not require Extended Quota Mode.
 
@@ -72,25 +72,51 @@ When focused on the provider panel:
 
 After you load a playlist, Cliamp returns to the standard playlist view. Use the usual controls for seek, volume, EQ, shuffle, repeat, queue, search, and lyrics.
 
+With the playlist in focus, press `W` on a track to start its Spotify radio: the station Spotify builds from that song. It replaces the queue and starts playing. A new station can start at most once every 10 seconds, because starting one opens its first tracks straight away, and Spotify briefly refuses playback when tracks are opened too quickly for too long. Moving through a station that is already playing is not limited. If playback is refused, it recovers by itself once you slow down, usually within seconds to a few minutes.
+
+Large playlists fill in as they load. Cliamp shows the first tracks, appends the remaining pages in the background, and stays usable while the list arrives.
+
 ## Playlists and albums
 
 The provider lists both playlists and saved albums in the Spotify library. Playlists include those you created and saved, or followed. If a public playlist is missing, open Spotify and click **Save** first. You do not need to copy tracks to a new playlist.
+
+Playlists are grouped by the folders you keep them in, in the order Spotify stores them, with a folder inside another shown as `Parent / Child`. Playlists outside any folder are grouped by owner instead.
 
 Saved albums appear under a **Saved albums** section, labelled `Artist - Album` and sorted alphabetically by artist. These are the albums in **Your Library**. To add one, open the album in Spotify and click **Save**. Selecting a saved album loads all of its tracks in disc and track order.
 
 ## Podcasts
 
-Podcast episodes work as tracks. Press `Ctrl+F` to search Spotify. Matching episodes, such as "Joe Rogan", appear with songs. Press `Enter` to play. Playlists can load and play both songs and episodes.
+Podcast episodes work as tracks. Press `Ctrl+F` to search Spotify. Matching episodes, such as "Joe Rogan", appear with songs. Press `Enter` to play. Playlists can load and play both songs and episodes, except when a playlist is read through the client protocol -- see below -- which serves songs only.
+
+## How Cliamp reads your library
+
+Cliamp reads Spotify two ways. The Web API is the documented one and serves most things. The client protocol is the one Cliamp already speaks to play audio, and it reaches what the Web API will not: playlist folders, saved radios, Spotify's own mixes, and playlists owned by someone else, all of which a Development Mode app is refused.
+
+By default the Web API is tried first and the client protocol only picks up what it declines, so ordinary use is unchanged. Two reads are the exception, both because the Web API does not fail there and so a fallback could never reach them: the library listing, which it answers with less (no folders, and none of the playlists it will not serve), and Liked Songs, which it serves fifty tracks per request. A library of several thousand tracks is over a hundred requests that way, which is how a day-long throttle is earned, so the client protocol leads and the Web API is the fallback.
+
+Set `CLIAMP_SPOTIFY_API` to change this:
+
+| Value | Behaviour |
+|---|---|
+| `auto` | Default. Web API first, client protocol for what it refuses. |
+| `client` | Never fall back to the Web API for a read the client protocol can serve, so a broken internal endpoint surfaces instead of being masked. Saved albums, album tracks, search and the Liked Songs count have no client-protocol equivalent and still use the Web API in this mode. |
+| `web` | Web API only. Cliamp's behaviour before the client protocol was added; folders, saved radios and other people's playlists are unavailable. |
+
+Track counts beside folder-grouped playlists come from Spotify's own library listing and are a cached figure, so one can sit a track or two off what the playlist actually holds. The list itself is always read fresh.
+
+A playlist read through the client protocol serves songs only: podcast episodes and your own local files ride in the same list but cannot be played from there, so they are skipped. In `auto` this affects only playlists the Web API refused, which previously showed nothing at all.
+
+The client protocol is undocumented and can change without notice, which is why `auto` falls back to the Web API wherever it can and why `web` exists as an escape hatch. `client` deliberately does not fall back.
 
 ## Troubleshooting
 
-- **"OAuth failed"**: Ensure the Spotify dashboard redirect URI is exactly `http://127.0.0.1:19872/login`, without a trailing slash.
+- **"OAuth failed"**: Ensure the Spotify dashboard redirect URI is exactly `http://127.0.0.1:19872/login`, without a trailing slash. The temporary callback server listens only on this local address and does not accept connections from the network.
 - **Two authorization steps**: This is expected with your own `client_id`. After you approve Web API access, the same browser tab redirects to create a playback credential with the required Spotify built-in identity.
 - **Playlist not showing**: Save or follow the playlist in Spotify. The provider lists only library playlists.
 - **Playback issues**: Spotify integration needs a Premium account. Free accounts cannot stream.
 - **Re-authenticate**: Run `cliamp spotify reset` to clear stored credentials. Then restart cliamp, select Spotify, and sign in again. This is the same as deleting `~/.config/cliamp/spotify_credentials.json`.
-- **Persistent "rate-limited" errors on `/v1/me`**: Stored authorization has expired or been revoked. Cliamp usually detects this at startup and prompts for sign-in. If it does not, run `cliamp spotify reset` and authenticate again. This is *not* a Spotify rate limit. Waiting does not fix it.
-- **`429 Too Many Requests` on search or playlist loading (using the built-in fallback)**: The built-in `client_id` is shared with librespot- and spotify-player-based clients. When the global pool is busy, Spotify limits requests for every client that uses it. Cliamp retries with exponential backoff. If errors continue, register a developer app and set `client_id` in `[spotify]`. Your app has a separate quota.
+- **Expired or revoked authorization**: Web API calls fail with `401 Unauthorized`, and playback asks for a new sign-in. Cliamp usually detects this at startup and prompts. If it does not, run `cliamp spotify reset` and authenticate again.
+- **`429 Too Many Requests`, including `rate-limited on /v1/me`**: Spotify accepted the credentials and throttled the *app*, so re-authenticating does not help. With the built-in `client_id`, the quota is shared with librespot- and spotify-player-based clients worldwide, and a busy pool limits every client that uses it. Cliamp retries with exponential backoff, honoring `Retry-After`. A `Retry-After` of hours (for example `86400`) means the app has no quota left for that window: register a developer app and set `client_id` in `[spotify]`. Your app has a separate quota.
 - **`400 "Invalid limit"` on <kbd>Ctrl+F</kbd>**: Development Mode apps limit `/v1/search` to 10 results per request. Cliamp pages results automatically. This error means the limit is now less than 10. Open an issue.
 
 ## Requirements

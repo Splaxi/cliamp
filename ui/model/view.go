@@ -26,26 +26,35 @@ const (
 	titleScrollInterval = 200 * time.Millisecond
 )
 
-// Pre-built styles for elements created per-render to avoid repeated allocation.
+// Pre-built styles for elements created per-render to avoid repeated
+// allocation. Built by rebuildModelStyles (styles.go), never here.
 var (
-	seekFillStyle = lipgloss.NewStyle().Foreground(ui.ColorSeekBar)
-	seekDimStyle  = lipgloss.NewStyle().Foreground(ui.ColorDim)
-	volBarStyle   = lipgloss.NewStyle().Foreground(ui.ColorVolume)
-	activeToggle  = lipgloss.NewStyle().Foreground(ui.ColorAccent).Bold(true)
+	seekFillStyle lipgloss.Style
+	seekDimStyle  lipgloss.Style
+	volBarStyle   lipgloss.Style
+	activeToggle  lipgloss.Style
 	// favMarkerStyle paints the favorite heart in the theme's red so it
 	// reads as a deliberate accent instead of inheriting the dim/unavailable
 	// look. The glyph carries U+FE0E (text presentation) so terminals render
 	// it as a compact font glyph rather than a large color emoji.
-	favMarkerStyle = lipgloss.NewStyle().Foreground(ui.ColorError)
+	favMarkerStyle lipgloss.Style
 	// favRemovedStyle mutes the same filled heart for unfavorite feedback:
 	// identical attractive glyph, faded to signal the removed state instead
 	// of switching to a thin outline glyph.
-	favRemovedStyle = lipgloss.NewStyle().Foreground(ui.ColorDim)
+	favRemovedStyle lipgloss.Style
 )
 
 // favHeart is the small, text-presentation favorite heart used everywhere the
 // UI shows favorite state (track rows, header badge, status messages).
 const favHeart = "♥\uFE0E"
+
+// playedMarker and partialMarker flag an episode listened to the end and one
+// stopped part-way. Both carry the text variation selector so terminals render
+// them one cell wide, as favHeart does.
+const (
+	playedMarker  = "\u2713\uFE0E"
+	partialMarker = "\u25D1\uFE0E"
+)
 
 // Seek-bar glyphs. Played cells are heavy and the unplayed remainder light, so
 // the two differ in weight and not only in color, and a round head marks the
@@ -56,11 +65,13 @@ const (
 	seekEmptyGlyph = "─"
 )
 
-// Pre-rendered toggle feedback marks for the status bar.
-var (
-	favAddedMark   = favMarkerStyle.Render(favHeart)
-	favRemovedMark = favRemovedStyle.Render(favHeart)
-)
+// Toggle feedback marks for the status bar. Rendered per call, not stored, so
+// they pick up favMarkerStyle/favRemovedStyle as rebuildModelStyles leaves
+// them after a theme change. Both call sites are key handlers, not the render
+// loop.
+func favAddedMark() string { return favMarkerStyle.Render(favHeart) }
+
+func favRemovedMark() string { return favRemovedStyle.Render(favHeart) }
 
 // providerEmptyStateHint, keyed by lowercase provider Name(), returns the
 // remediation hint shown under the generic "No playlists in X" message.
@@ -561,16 +572,35 @@ func (m Model) renderSpectrum() string {
 // with minimal track info and a seek bar.
 func (m Model) renderFullVisualizer() string {
 	sections := []string{
-		m.renderTrackInfo(),
+		m.fullVisTopLine(),
 		m.renderTimeStatus(),
 		"",
 		m.renderSpectrum(),
 		m.renderSeekBar(),
 		"",
-		helpKey("V", "Exit ") + helpKey("v", "Mode:"+m.vis.ModeName()+" ") + helpKey("Spc", "▶❚❚ ") + helpKey("<>", "Trk ") + helpKey("+-", "Vol ") + helpKey("?", "Keys"),
+		helpKey("V", "Exit ") + helpKey("v", "Mode:"+m.vis.ModeName()+" ") + helpKey("Spc", "▶❚❚ ") + helpKey("<>", "Trk ") + helpKey("+-", "Vol ") + helpKey("t", "Title ") + helpKey("?", "Keys"),
 	}
 
 	return strings.Join(sections, "\n")
+}
+
+// fullVisTopLine names what is playing, or just the source when the track has
+// been hidden. The full-screen visualizer is the view most likely to be on a
+// shared screen, so naming the episode has to be optional.
+func (m Model) fullVisTopLine() string {
+	if !m.hideTrackInfo {
+		return m.renderTrackInfo()
+	}
+	// The playing track may belong to a provider the listener has since
+	// switched away from, so prefer the one recorded when it started.
+	name := m.playingProvider
+	if name == "" && m.provider != nil {
+		name = m.provider.Name()
+	}
+	if name == "" {
+		name = "Playing"
+	}
+	return dimStyle.Render("[" + name + "]")
 }
 
 func (m Model) renderSeekBar() string {
@@ -793,8 +823,8 @@ func (m Model) renderPlaybackHeader() string {
 	if qLen := m.playlist.QueueLen(); qLen > 0 {
 		badges = append(badges, activeToggle.Render(fmt.Sprintf("[Queue: %d]", qLen)))
 	}
-	if bookmarkCount := m.playlist.BookmarkCount(); bookmarkCount > 0 {
-		badges = append(badges, activeToggle.Render(fmt.Sprintf("[★ %d]", bookmarkCount)))
+	if starCount := m.playlistStarCount(); starCount > 0 {
+		badges = append(badges, activeToggle.Render(fmt.Sprintf("[★ %d]", starCount)))
 	}
 	// Render from the cached favSet: the render path must not hit disk.
 	if count := len(m.favSet); count > 0 {
@@ -1019,6 +1049,10 @@ func (m Model) renderPlaylist() string {
 	lines := make([]string, 0, budget)
 	numWidth := len(fmt.Sprintf("%d", trackCount))
 	cols := m.markerColumns()
+	var stateReporters []provider.PlaybackStateReporter
+	if cols.played {
+		stateReporters = m.playbackStateReporters()
+	}
 
 	for row := range m.playlistRows(tracks, localScroll, m.showAlbumHeaders) {
 		if row.Index < 0 {
@@ -1077,7 +1111,7 @@ func (m Model) renderPlaylist() string {
 		}
 		if cols.bookmark {
 			mark := " "
-			if t.Bookmark {
+			if m.playlistTrackStarred(t) {
 				mark = "★"
 			}
 			markers += mark
@@ -1090,6 +1124,19 @@ func (m Model) renderPlaylist() string {
 			}
 			markers += mark
 			styledMarkers += favMarkerStyle.Render(mark)
+		}
+		if cols.played {
+			mark, markStyle := " ", dimStyle
+			if state, ok := playbackStateFrom(stateReporters, t); ok {
+				switch {
+				case state.Played:
+					mark, markStyle = playedMarker, activeToggle
+				case state.Position > 0:
+					mark, markStyle = partialMarker, dimStyle
+				}
+			}
+			markers += mark
+			styledMarkers += markStyle.Render(mark)
 		}
 		markers += " "
 		styledMarkers += " "

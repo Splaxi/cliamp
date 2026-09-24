@@ -34,6 +34,7 @@ func buildApp() *cli.Command {
 		&cli.BoolWithInverseFlag{Name: "auto-play", Usage: "start playback immediately"},
 		&cli.BoolWithInverseFlag{Name: "simplified", Usage: "simplified playback view (no visualizer or playlist)"},
 		&cli.BoolWithInverseFlag{Name: "help-bar", Usage: "show the key-binding hint bar (? still opens the full keymap)", Value: true},
+		&cli.BoolWithInverseFlag{Name: "expanded", Usage: "start with the playlist expanded (the Ctrl+X state)"},
 		&cli.StringFlag{Name: "provider", Usage: "default provider: radio, podcast, navidrome, lyrion, plex, jellyfin, emby, spotify, qobuz, tidal, soundcloud, mixcloud, netease, yandex, audiobookshelf, abs, yt, youtube, ytmusic"},
 		&cli.StringFlag{Name: "start-theme", Usage: "UI theme name"},
 		&cli.StringFlag{Name: "visualizer", Usage: "visualizer mode"},
@@ -72,6 +73,7 @@ func buildApp() *cli.Command {
 			pluginsCommand(),
 			playlistCommand(),
 			historyCommand(),
+			radioCommand(),
 			setupCommand(),
 			spotifyCommand(),
 			qobuzCommand(),
@@ -156,6 +158,10 @@ func overridesFromFlags(c *cli.Command) (config.Overrides, error) {
 	if c.IsSet("help-bar") {
 		v := !c.Bool("help-bar")
 		ov.HideHelpBar = &v
+	}
+	if c.IsSet("expanded") {
+		v := c.Bool("expanded")
+		ov.Expanded = &v
 	}
 	if c.IsSet("provider") {
 		v := strings.ToLower(c.String("provider"))
@@ -362,6 +368,38 @@ func protocolCommand() *cli.Command {
 					return cmd.ProtocolStatus(os.Stdout)
 				},
 			},
+		},
+	}
+}
+
+// radioCommand is an easter egg: the "who's listening" globe from
+// cliamp.stream, in the terminal. The website's stats card shows the command
+// as a prompt; it is left out of the help listing so that stays the only hint.
+func radioCommand() *cli.Command {
+	return &cli.Command{
+		Name:   "radio",
+		Usage:  "who is listening to the cliamp radio channels",
+		Hidden: true,
+		Description: "Shows live listener statistics for the cliamp radio channels from\n" +
+			"radio.cliamp.stream: listeners now, by country and by channel, plus the\n" +
+			"all-time totals. --globe draws them on a spinning globe, like the one\n" +
+			"on cliamp.stream.",
+		Flags: []cli.Flag{
+			&cli.BoolFlag{Name: "stats", Usage: "print live listener statistics"},
+			&cli.BoolFlag{Name: "globe", Usage: "show the statistics on an animated globe (implies --stats)"},
+			&cli.BoolFlag{Name: "json", Usage: "print the raw statistics document (implies --stats)"},
+		},
+		Action: func(ctx context.Context, c *cli.Command) error {
+			switch {
+			case c.Bool("globe") && c.Bool("json"):
+				return fmt.Errorf("--globe and --json cannot be combined")
+			case c.Bool("globe"):
+				return cmd.RadioGlobe(ctx, c.Root().String("start-theme"))
+			case c.Bool("stats") || c.Bool("json"):
+				return cmd.RadioStats(ctx, os.Stdout, c.Bool("json"))
+			default:
+				return cli.ShowSubcommandHelp(c)
+			}
 		},
 	}
 }
@@ -779,7 +817,7 @@ func volumeCommand() *cli.Command {
 func seekCommand() *cli.Command {
 	return &cli.Command{
 		Name:      "seek",
-		Usage:     "seek to position in seconds",
+		Usage:     "seek by a relative offset in seconds",
 		ArgsUsage: "<seconds>",
 		Action: func(ctx context.Context, c *cli.Command) error {
 			if c.Args().Len() == 0 {

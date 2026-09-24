@@ -17,6 +17,7 @@ import (
 	"github.com/bjarneo/cliamp/internal/fileutil"
 	"github.com/bjarneo/cliamp/playlist"
 	"github.com/bjarneo/cliamp/provider"
+	"github.com/bjarneo/cliamp/tracksave"
 )
 
 // quit shuts down the player and signals the TUI to exit.
@@ -29,11 +30,14 @@ func (m *Model) quit() tea.Cmd {
 	if track, _ := m.currentPlaybackTrack(); track.Path != "" &&
 		(!playlist.IsYTDL(track.Path) || playlist.IsMixcloudURL(track.Path)) &&
 		!track.IsLive() &&
-		m.player.IsPlaying() {
+		m.player.IsPlaying() && !m.buffering && !m.player.GaplessAdvanced() {
 		if secs := int(m.player.Position().Seconds()); secs > 0 {
+			context, contextIndex := m.playbackContextFor(track)
 			m.exitResume.path = track.Path
 			m.exitResume.secs = secs
 			m.exitResume.playlist = m.loadedPlaylist
+			m.exitResume.context = cloneTracks(context)
+			m.exitResume.contextIndex = contextIndex
 		}
 	}
 
@@ -266,6 +270,11 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return m.handlePlaylistManagerKey(msg)
 	}
 
+	// Subscribed-shows overlay
+	if m.subs.visible {
+		return m.handleSubsKey(msg)
+	}
+
 	// Queue manager overlay
 	if m.queue.visible {
 		return m.handleQueueKey(msg)
@@ -304,6 +313,14 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			m.lyrics.visible = false
 		case "r":
 			return m.retryLyrics()
+		case "[":
+			if m.lyricsSyncable() && m.lyricsHaveTimestamps() {
+				return m.nudgeLyricsOffset(-250 * time.Millisecond)
+			}
+		case "]":
+			if m.lyricsSyncable() && m.lyricsHaveTimestamps() {
+				return m.nudgeLyricsOffset(250 * time.Millisecond)
+			}
 		case "up", "k":
 			if !(m.lyricsSyncable() && m.lyricsHaveTimestamps()) && m.lyrics.scroll > 0 {
 				m.lyrics.scroll--
@@ -371,6 +388,14 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m.quit()
+		case "F":
+			if !m.openSubsOverlay() && m.luaMgr != nil {
+				m.luaMgr.EmitKey(msg.String())
+			}
+		case "l":
+			return m.loadLatestFromProviderList()
+		case "a":
+			return m.appendShowFromProviderList()
 		case "p":
 			if m.isActiveProvider("Local") && m.localProvider != nil {
 				m.openPlaylistManager()
@@ -619,8 +644,7 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		// Stopping counts like skipping: if the track passed the 50%
 		// threshold, it lands in Recently Played before teardown.
 		refresh := m.scrobbleCurrent()
-		m.player.Stop()
-		m.clearPlaybackTrack()
+		m.stopPlayback()
 		m.notifyPlayback()
 		return refresh
 
@@ -661,25 +685,10 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 		return m.doSeek(m.seekStepLarge)
 
 	case "f":
-		if m.focus == focusPlaylist && m.plCursor >= 0 && m.plCursor < m.playlist.Len() && m.loadedPlaylist != "" {
-			if bs, ok := m.localProvider.(provider.BookmarkSetter); ok {
-				track, ok := m.playlist.Track(m.plCursor)
-				if !ok {
-					return nil
-				}
-				if err := bs.SetBookmarkByPath(m.loadedPlaylist, track.Path); err != nil {
-					m.status.Errorf(statusTTLDefault, "Save failed: %s", err)
-					return nil
-				}
-				m.playlist.ToggleBookmark(m.plCursor)
-				track, _ = m.playlist.Track(m.plCursor)
-				if track.Bookmark {
-					m.status.Showf(statusTTLDefault, "★ %s", track.DisplayName())
-				} else {
-					m.status.Showf(statusTTLDefault, "☆ %s", track.DisplayName())
-				}
-			}
-		}
+		return m.togglePlaylistStar()
+
+	case "W":
+		return m.startTrackRadio()
 
 	case "n":
 		if m.focus == focusPlaylist && m.plCursor >= 0 && m.plCursor < m.playlist.Len() && m.favMgr != nil {
@@ -694,9 +703,9 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			}
 			m.refreshFavSet()
 			if added {
-				m.status.Showf(statusTTLDefault, favAddedMark+" %s", track.DisplayName())
+				m.status.Showf(statusTTLDefault, favAddedMark()+" %s", track.DisplayName())
 			} else {
-				m.status.Showf(statusTTLDefault, favRemovedMark+" %s", track.DisplayName())
+				m.status.Showf(statusTTLDefault, favRemovedMark()+" %s", track.DisplayName())
 			}
 			// The provider pane renders Favorites counts from Playlists();
 			// re-pull so it reflects the toggle. The manager list refreshes
@@ -851,6 +860,13 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) tea.Cmd {
 			m.queue.visible = true
 			m.queue.cursor = 0
 			m.queue.scroll = 0
+		}
+
+	case "F":
+		// Keep plugin key bindings working: when the overlay does not open,
+		// F is no longer an unhandled key here, so forward it explicitly.
+		if !m.openSubsOverlay() && m.luaMgr != nil {
+			m.luaMgr.EmitKey(msg.String())
 		}
 
 	case "ctrl+s":
@@ -1054,6 +1070,10 @@ func (m *Model) handleFullVisualizerKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.vis.CycleMode()
 		m.vis.RequestRefresh()
 		m.refreshChrome()
+	case "t":
+		// Hide the episode name so the full-screen visualizer can be put on a
+		// shared screen without naming what is playing.
+		m.hideTrackInfo = !m.hideTrackInfo
 	case "ctrl+k", "?":
 		m.exitFullVisualizer()
 		m.openKeymap()
@@ -1061,7 +1081,7 @@ func (m *Model) handleFullVisualizerKey(msg tea.KeyPressMsg) tea.Cmd {
 	return nil
 }
 
-// saveTrack copies the current track to ~/Music/cliamp/ with a clean filename.
+// saveTrack saves the current track in the configured downloads directory.
 // For yt-dlp tracks (piped streams), triggers an async download via yt-dlp.
 // For local temp files, copies synchronously.
 func (m *Model) saveTrack() tea.Cmd {
@@ -1071,19 +1091,18 @@ func (m *Model) saveTrack() tea.Cmd {
 		return nil
 	}
 
-	home, err := os.UserHomeDir()
+	saveDir, err := tracksave.Directory(m.downloadsDirectory)
 	if err != nil {
 		m.status.Errorf(statusTTLShort, "Save failed: %s", err)
 		return nil
 	}
 
-	saveDir := filepath.Join(home, "Music", "cliamp")
 	if err := os.MkdirAll(saveDir, 0o755); err != nil {
 		m.status.Errorf(statusTTLShort, "Save failed: %s", err)
 		return nil
 	}
 
-	// YouTube/yt-dlp tracks: async download directly to ~/Music/cliamp/.
+	// YouTube/yt-dlp tracks: download asynchronously into the selected directory.
 	if playlist.IsYouTubeURL(track.Path) || playlist.IsYTDL(track.Path) {
 		m.status.Clear()
 		m.save.startDownload()
@@ -1116,7 +1135,7 @@ func (m *Model) saveTrack() tea.Cmd {
 		return nil
 	}
 
-	m.status.Showf(statusTTLDefault, "Saved to ~/Music/cliamp/%s", name+ext)
+	m.status.Showf(statusTTLDefault, "Saved to %s", dest)
 	return nil
 }
 
@@ -1887,6 +1906,8 @@ func (m *Model) handlePlMgrListKey(msg tea.KeyPressMsg) tea.Cmd {
 		m.plManager.screen = plMgrScreenNewName
 		m.plManager.newName = ""
 		m.plManager.inputErr = ""
+	case "A":
+		return m.plMgrAppendPlaylist()
 	case "D":
 		// Choose directories for the highlighted playlist: the file browser
 		// opens targeted at it, where D/Enter adds folders as [[dir]] sources.
@@ -2102,6 +2123,8 @@ func (m *Model) handlePlMgrTracksKey(msg tea.KeyPressMsg) tea.Cmd {
 		}
 	case "a":
 		m.plMgrToggleMarkAll()
+	case "A":
+		return m.plMgrAppendSelectedTracks()
 	case "s":
 		m.plMgrSortTracks()
 	case "w":
@@ -2150,9 +2173,9 @@ func (m *Model) handlePlMgrTracksKey(msg tea.KeyPressMsg) tea.Cmd {
 				}
 				m.refreshFavSet()
 				if added {
-					m.status.Showf(statusTTLDefault, favAddedMark+" %s", track.DisplayName())
+					m.status.Showf(statusTTLDefault, favAddedMark()+" %s", track.DisplayName())
 				} else {
-					m.status.Showf(statusTTLDefault, favRemovedMark+" %s", track.DisplayName())
+					m.status.Showf(statusTTLDefault, favRemovedMark()+" %s", track.DisplayName())
 				}
 				// Inside the Favorites screen a toggle re-reads the store so
 				// the rows mirror it: an unfavorite drops the row, a
@@ -2197,6 +2220,7 @@ func (m *Model) plMgrLoadAndPlay(startIdx int) tea.Cmd {
 	m.player.Stop()
 	m.player.ClearPreload()
 	m.resetYTDLBatch()
+	m.retireTracksPaging()
 	m.replacePlaylist(m.plManager.tracks)
 	m.setHeaderStateFromTracks(m.plManager.tracks)
 	m.loadedPlaylist = m.plManager.selPlaylist

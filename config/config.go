@@ -74,7 +74,7 @@ type NavidromeConfig struct {
 	URL              string // e.g. "https://music.example.com"
 	User             string
 	Password         string
-	Format           string
+	Format           string // requested stream format; empty lets the server decide, "raw" requests the original
 	BrowseSort       string // album browse sort order, e.g. "alphabeticalByName"
 	ScrobbleDisabled bool   // true only when "scrobble = false" is explicitly set
 }
@@ -339,8 +339,14 @@ func (a AudiobookshelfConfig) IsSet() bool {
 	return a.URL != "" && (a.Token != "" || (a.User != "" && a.Password != ""))
 }
 
+// DownloadsConfig selects the directory for saved audio. Empty uses ~/Music/cliamp.
+type DownloadsConfig struct {
+	Directory string
+}
+
 // Config holds user preferences loaded from the config file.
 type Config struct {
+	Downloads        DownloadsConfig
 	Volume           float64     // dB, clamped at runtime to [VolumeMin, +6]
 	VolumeMin        float64     // dB floor, range [-90, 0]; default -50
 	VisVolumeLinked  bool        // when true, visualizer bar height follows volume; default true
@@ -364,11 +370,13 @@ type Config struct {
 	HideHelpBar      bool                         // hide the key-binding hint bar above the status line
 	HideSettingsPane bool                         // close the settings pane beside the playlist
 	ShowMetadata     bool                         // expand highlighted-track metadata below settings (default false)
+	Expanded         bool                         // start with the playlist expanded (the Ctrl+X state)
 	PaddingH         int                          // horizontal padding for the UI frame (default 3)
 	PaddingV         int                          // vertical padding for the UI frame (default 1)
 	AudioDevice      string                       // preferred audio output device name (empty = system default)
 	Playlist         string                       // local TOML playlist name to load on startup
 	InitialDirectory string                       // initial directory for the file browser
+	LyricsOffsetMs   int                          // lyric timestamp adjustment in ms (-10000..10000), applied to all sources
 	Navidrome        NavidromeConfig              // optional Navidrome/Subsonic server credentials
 	Lyrion           LyrionConfig                 // optional Lyrion Music Server (LMS) instance
 	Spotify          SpotifyConfig                // optional Spotify provider (requires Premium)
@@ -481,6 +489,10 @@ func Load() (Config, error) {
 		val = strings.TrimSpace(val)
 
 		switch section {
+		case "downloads":
+			if key == "directory" {
+				cfg.Downloads.Directory = parseString(val)
+			}
 		case "navidrome":
 			switch key {
 			case "url":
@@ -700,6 +712,10 @@ func Load() (Config, error) {
 				if v, err := strconv.Atoi(val); err == nil {
 					cfg.SeekStepLarge = v
 				}
+			case "lyrics_offset_ms":
+				if v, err := strconv.Atoi(val); err == nil {
+					cfg.LyricsOffsetMs = v
+				}
 			case "eq":
 				cfg.EQ = parseEQ(val)
 			case "eq_preset":
@@ -742,6 +758,8 @@ func Load() (Config, error) {
 				cfg.HideSettingsPane = val == "true"
 			case "show_metadata":
 				cfg.ShowMetadata = val == "true"
+			case "expanded":
+				cfg.Expanded = strings.ToLower(val) == "true"
 			case "audio_device":
 				cfg.AudioDevice = parseString(val)
 			case "initial_directory":
@@ -996,6 +1014,7 @@ func (c *Config) clamp() {
 		c.Speed = 1.0
 	}
 	c.SeekStepLarge = max(min(c.SeekStepLarge, 600), 6)
+	c.LyricsOffsetMs = max(min(c.LyricsOffsetMs, 10000), -10000)
 	c.SampleRate = clampSampleRate(c.SampleRate)
 	c.BufferMs = max(min(c.BufferMs, 5000), 50)
 	c.ResampleQuality = max(min(c.ResampleQuality, 4), 1)

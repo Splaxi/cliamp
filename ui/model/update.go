@@ -96,7 +96,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			// A newer target arrived while this seek was running; land on it
 			// rather than reporting this now-stale position as final.
-			return m, m.commitPendingSeek()
+			cmd := m.commitPendingSeek()
+			return m, cmd
 		}
 		m.seek.pending = false
 		// Only clear seekActive if no new seek keypresses arrived during loading.
@@ -119,13 +120,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status.Warningf(statusTTLMedium, "Seek failed; playback continues from the previous position: %s", msg.err)
 			}
 			m.notifyAll()
-			return m, m.preloadNext()
+			cmd := m.preloadNext()
+			return m, cmd
 		}
 		if msg.resume {
 			m.status.Showf(statusTTLDefault, "Resumed at %s", formatJumpClock(msg.target))
 		}
 		m.finishSeek()
-		return m, m.preloadNext()
+		cmd := m.preloadNext()
+		return m, cmd
 
 	case ytdlUnpauseReconnectMsg:
 		m.seek.active = false
@@ -304,8 +307,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.normalizeQueueOverlay()
 			}
 			if !ok {
-				m.player.Stop()
-				m.clearPlaybackTrack()
+				m.endQueue()
 				m.notifyAll()
 				cmds = append(cmds, tickCmdAt(m.tickInterval()))
 				return m, tea.Batch(cmds...)
@@ -330,6 +332,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.preloadNext())
 			m.notifyAll()
 		}
+		m.tickResumeSave(now)
 		// Check if gapless drained (end of playlist, no preloaded next).
 		// Skip if already buffering a yt-dlp download to avoid advancing
 		// the playlist on every tick while waiting for the resolve.
@@ -364,8 +367,10 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		// the current stream has >streamPreloadLeadTime remaining. Poll every tick
 		// until we're within the window and the preload gets armed.
 		// Guard with !m.preloading so we don't fire a second concurrent HTTP
-		// connection while the first preloadStreamCmd goroutine is still running.
-		if m.player.IsPlaying() && !m.player.IsPaused() && !m.buffering && !m.preloading && !m.player.HasPreload() {
+		// connection while the first preloadStreamCmd goroutine is still running,
+		// and with !m.tracksPaging because each page of a paged load remixes the
+		// upcoming order, so anything armed now would be stale by the next one.
+		if m.player.IsPlaying() && !m.player.IsPaused() && !m.buffering && !m.preloading && !m.tracksPaging && !m.player.HasPreload() {
 			if cmd := m.preloadNext(); cmd != nil {
 				cmds = append(cmds, cmd)
 			}
@@ -380,7 +385,15 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.openDefaultProviderOnce = false
-		return m, m.openDefaultProviderBrowser()
+		cmd := m.openDefaultProviderBrowser()
+		return m, cmd
+
+	case radioListsRefreshMsg:
+		if msg.gen != m.requests.provider || !m.isActiveProvider("Radio") {
+			return m, nil
+		}
+		cmd := m.refreshRadioLists()
+		return m, cmd
 
 	case playlistsLoadedMsg:
 		if msg.gen != m.requests.provider || !m.isActiveProvider(msg.providerName) {
@@ -388,6 +401,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.provLoading = m.provSearch.loading
 		if msg.err != nil {
+			if errors.Is(msg.err, playlist.ErrRateLimited) {
+				// A cooldown passes on its own, so it does not belong in the
+				// slot that has no expiry and hides every later status.
+				m.status.Warningf(statusTTLDefault, "Spotify is rate limiting — %s", msg.err)
+				return m, nil
+			}
 			if errors.Is(msg.err, playlist.ErrNeedsAuth) {
 				m.provSignIn = true
 				m.err = nil
@@ -400,35 +419,102 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.err = nil
 			m.status.Warningf(statusTTLLong, "%s", msg.err)
 		}
-		m.providerLists = providerListsWithBrowse(m.provider, msg.playlists)
-		m.provCursor = min(m.provCursor, max(0, len(m.providerLists)-1))
-		// Start loading catalog when the provider supports lazy catalog loading.
-		if cs, ok := m.provider.(provider.CatalogSearcher); ok && cs.IsSearching() {
+		m.replaceProviderLists(msg.playlists)
+		cmd := m.startCatalogLoading()
+		return m, cmd
+
+	case trackRadioMsg:
+		// Whatever became of it, this request is over, so W is free again --
+		// including when it was superseded, or the key would stay locked.
+		m.trackRadio.starting = false
+		if msg.gen != m.requests.tracks || !m.isActiveProvider(msg.providerName) {
 			return m, nil
 		}
-		if loader, ok := m.provider.(provider.CatalogLoader); ok && !m.catalogBatch.loading && !m.catalogBatch.done && !m.provSearch.active && !m.provSearch.loading {
-			m.catalogBatch.loading = true
-			return m, m.fetchCatalogBatch(loader)
+		m.provLoading = false
+		m.tracksPaging = false
+		if msg.err != nil {
+			m.status.Errorf(statusTTLDefault, "Radio failed: %s", msg.err)
+			return m, nil
 		}
-		return m, nil
+		if len(msg.tracks) == 0 {
+			m.status.Warningf(statusTTLDefault, "Radio came back empty")
+			return m, nil
+		}
+		// Only a station that actually starts spends the interval: one that
+		// failed or came back empty opened no tracks, so retrying costs nothing.
+		m.trackRadio.lastStart = time.Now()
+		// A station is a fresh queue rather than an addition: the point is to
+		// leave what you were listening to and follow the seed instead.
+		m.replacePlayerPlaylist(msg.tracks)
+		// The queue is a station now, not the playlist that was loaded.
+		m.activeProviderPlaylistID = ""
+		m.playlist.SetIndex(0)
+		m.plCursor = 0
+		m.adjustScroll()
+		m.status.Successf(statusTTLDefault, "Radio from %s — %d tracks", trackViewName(msg.seed), len(msg.tracks))
+		cmd := m.playCurrentTrack()
+		m.notifyAll()
+		return m, cmd
 
 	case tracksLoadedMsg:
 		if msg.gen != m.requests.tracks || !m.isActiveProvider(msg.providerName) {
 			return m, nil
 		}
 		m.provLoading = false
+		m.tracksPaging = msg.err == nil && msg.next > 0
 		if msg.err != nil {
 			if errors.Is(msg.err, playlist.ErrNeedsAuth) {
 				m.provSignIn = true
 				m.err = nil
 				return m, nil
 			}
+			if errors.Is(msg.err, playlist.ErrRateLimited) {
+				// A cooldown passes on its own, and the message says how long.
+				// Keeping it in the permanent slot would sit in front of every
+				// later status for the rest of the session.
+				m.status.Warningf(statusTTLDefault, "Spotify is rate limiting — %s", msg.err)
+				return m, nil
+			}
+			if errors.Is(msg.err, playlist.ErrListChanged) {
+				// The list moved under a paged read, so what is on screen is a
+				// partial view of a list that no longer exists. Say so and let it
+				// expire: reopening starts a clean load, and a persistent error
+				// would sit in front of every later status message.
+				m.status.Warningf(statusTTLDefault, "Playlist changed while loading — reopen current playlist to reload")
+				return m, nil
+			}
 			m.err = msg.err
 			return m, nil
 		}
-		m.replacePlayerPlaylist(msg.tracks)
-		if msg.playlistExact && m.localProvider != nil && msg.providerName == m.localProvider.Name() && msg.playlistID != history.PlaylistName {
-			m.loadedPlaylist = msg.playlistID
+		if msg.offset > 0 {
+			m.playlist.Add(msg.tracks...)
+			m.normalizeQueueOverlay()
+			m.addToHeaderState(msg.tracks)
+			// Add mixes the page into the upcoming shuffle order, so an armed
+			// preload may no longer be the next track. The gapless swap runs on
+			// the audio thread and the model then names the new track from
+			// playlist.Next(), so a stale preload would play one track while the
+			// UI, scrobble and now-playing announced another. Drop it and let the
+			// tick loop re-arm against the order this page produced.
+			if m.player.HasPreload() || m.preloading {
+				m.player.ClearPreload()
+				m.preloading = false
+			}
+		} else {
+			m.replacePlayerPlaylist(msg.tracks)
+			if msg.playlistExact && m.localProvider != nil && msg.providerName == m.localProvider.Name() && msg.playlistID != history.PlaylistName {
+				m.loadedPlaylist = msg.playlistID
+			}
+		}
+		if msg.next > 0 {
+			m.adjustScroll()
+			m.notifyAll()
+			if pager, ok := m.provider.(provider.TrackPager); ok {
+				return m, fetchTracksPageCmd(pager, msg.providerName, msg.playlistID, msg.next, msg.gen)
+			}
+		}
+		if msg.offset > 0 {
+			msg.tracks = m.playlist.Tracks()
 		}
 		m.applyTracksResume(msg)
 		m.adjustScroll()
@@ -509,6 +595,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.status.Warning("No tracks found", statusTTLDefault)
 				return m, nil
 			}
+			m.retireTracksPaging()
 			m.replacePlayerPlaylist(msg.tracks)
 			m.activeProviderPlaylistID = ""
 			if pr, ok := m.navBrowser.prov.(playlist.RefreshablePlaylist); ok &&
@@ -541,8 +628,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.catalogBatch.done = true
 			return m, nil
 		}
-		if lists, err := m.provider.Playlists(); err == nil {
-			m.providerLists = providerListsWithBrowse(m.provider, lists)
+		if err := m.refreshProviderListsNow(); err != nil {
+			m.err = err
 		}
 		m.catalogBatch.offset += msg.added
 		if msg.added < catalogBatchSize {
@@ -559,8 +646,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err != nil {
 			m.status.Errorf(statusTTLDefault, "Search failed: %s", msg.err)
 		} else {
-			if lists, err := m.provider.Playlists(); err == nil {
-				m.providerLists = providerListsWithBrowse(m.provider, lists)
+			if err := m.refreshProviderListsNow(); err != nil {
+				m.err = err
 			}
 			m.provCursor = 0
 			m.provScroll = 0
@@ -603,6 +690,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.status.Warning("No episodes found in feed.", statusTTLDefault)
 			return m, nil
 		}
+		m.retireTracksPaging()
 		m.replacePlaylist(msg.tracks)
 		m.loadedPlaylist = ""
 		m.setHeaderStateFromTracks(msg.tracks)
@@ -614,6 +702,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		playCmd := m.playCurrentTrack()
 		m.notifyAll()
 		return m, playCmd
+
+	case subsEpisodesMsg:
+		return m, m.handleSubsEpisodes(msg)
+
+	case subsLatestAllMsg:
+		return m, m.handleSubsLatestAll(msg)
 
 	case feedsLoadedMsg:
 		m.feedLoading = false
@@ -696,7 +790,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.refreshPlaylistManagerAfterWrite(msg.targetPlaylist)
 			// Track/dir counts in the provider pane come from Playlists();
 			// re-pull now that the file write has landed.
-			return m, m.refreshPaneAfterLocalWrite()
+			cmd := m.refreshPaneAfterLocalWrite()
+			return m, cmd
 		}
 		if msg.toPlaylist {
 			m.openPlaylistPicker(msg.tracks, fmt.Sprintf("%d tracks selected", len(msg.tracks)))
@@ -706,6 +801,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.player.Stop()
 			m.player.ClearPreload()
 			m.resetYTDLBatch()
+			m.retireTracksPaging()
 			m.replacePlaylist(msg.tracks)
 			m.loadedPlaylist = ""
 			m.setHeaderStateFromTracks(msg.tracks)
@@ -751,9 +847,11 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.reconnect.attempts = 0
 			m.reconnect.at = time.Time{}
 			resumeCmd = m.applyResume()
+			m.nowPlaying(track)
 		}
 		m.notifyAll()
-		return m, tea.Batch(resumeCmd, m.preloadNext())
+		preloadCmd := m.preloadNext()
+		return m, tea.Batch(resumeCmd, preloadCmd)
 
 	case streamPreloadedMsg:
 		if msg.gen != m.requests.preload {
@@ -835,11 +933,14 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.closeSpotSearch()
 		switch msg.action {
 		case spotAlbumAppend:
-			return m, m.appendAlbum(album, tracks)
+			cmd := m.appendAlbum(album, tracks)
+			return m, cmd
 		case spotAlbumQueueNext:
-			return m, m.queueAlbumNext(album, tracks)
+			cmd := m.queueAlbumNext(album, tracks)
+			return m, cmd
 		default:
-			return m, m.playAlbumImmediate(album, tracks)
+			cmd := m.playAlbumImmediate(album, tracks)
+			return m, cmd
 		}
 
 	case spotPlaylistsMsg:
@@ -901,7 +1002,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.provSignIn = false
 		m.provLoading = true
-		return m, m.fetchProviderPlaylists()
+		cmd := m.fetchProviderPlaylists()
+		return m, cmd
 
 	case ProvAuthURLMsg:
 		if !m.provLoading || !m.isActiveProvider(msg.ProviderName) {
@@ -973,7 +1075,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case playback.SetPositionMsg:
-		return m, m.seekAbsolute(msg.Position)
+		cmd := m.seekAbsolute(msg.Position)
+		return m, cmd
 
 	case playback.SetVolumeMsg:
 		m.player.SetVolume(msg.VolumeDB)
@@ -981,8 +1084,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case playback.StopMsg:
-		m.player.Stop()
-		m.clearPlaybackTrack()
+		m.stopPlayback()
 		m.notifyAll()
 		return m, nil
 
@@ -1004,7 +1106,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case PluginQueueMsg:
-		return m, m.handlePluginQueue(msg)
+		cmd := m.handlePluginQueue(msg)
+		return m, cmd
 
 	case pluginQueueAddedMsg:
 		if len(msg.tracks) > 0 {
@@ -1030,6 +1133,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		}
+		m.retireTracksPaging()
 		m.replacePlaylist(tracks)
 		m.setHeaderStateFromTracks(tracks)
 		if msg.Playlist != history.PlaylistName {
@@ -1226,34 +1330,44 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case ipc.QueueRequestMsg:
-		return m, m.handleIPCQueue(msg)
+		cmd := m.handleIPCQueue(msg)
+		return m, cmd
 
 	case ipc.LibraryRequestMsg:
-		return m, m.handleIPCLibrary(msg)
+		cmd := m.handleIPCLibrary(msg)
+		return m, cmd
 
 	case ipcProviderLoadResult:
-		return m, m.handleIPCProviderLoad(msg)
+		cmd := m.handleIPCProviderLoad(msg)
+		return m, cmd
 
 	case ipcFeedLoadResult:
-		return m, m.handleIPCFeedLoad(msg)
+		cmd := m.handleIPCFeedLoad(msg)
+		return m, cmd
 
 	case ipc.LyricsRequestMsg:
-		return m, m.handleIPCLyrics(msg)
+		cmd := m.handleIPCLyrics(msg)
+		return m, cmd
 
 	case ipc.HistoryRequestMsg:
-		return m, m.handleIPCHistory(msg)
+		cmd := m.handleIPCHistory(msg)
+		return m, cmd
 
 	case ipc.URLRequestMsg:
-		return m, m.handleIPCURL(msg)
+		cmd := m.handleIPCURL(msg)
+		return m, cmd
 
 	case ipcURLLoadResult:
-		return m, m.handleIPCURLResult(msg)
+		cmd := m.handleIPCURLResult(msg)
+		return m, cmd
 
 	case ipc.SaveRequestMsg:
-		return m, m.handleIPCSave(msg)
+		cmd := m.handleIPCSave(msg)
+		return m, cmd
 
 	case V2RequestMsg:
-		return m, m.handleV2Request(msg)
+		cmd := m.handleV2Request(msg)
+		return m, cmd
 
 	case ipcV2ResponseMsg:
 		if msg.Response.OK {

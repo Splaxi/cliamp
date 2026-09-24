@@ -90,8 +90,9 @@ func (m *Model) handleIPCSave(request ipc.SaveRequestMsg) tea.Cmd {
 		request.Reply <- ipc.Response{OK: false, Error: "nothing to save"}
 		return nil
 	}
+	directory := m.downloadsDirectory
 	return func() tea.Msg {
-		path, err := tracksave.Save(track)
+		path, err := tracksave.SaveTo(track, directory)
 		if err != nil {
 			request.Reply <- ipc.Response{OK: false, Error: err.Error()}
 		} else {
@@ -125,8 +126,7 @@ func (m *Model) handleIPCQueue(request ipc.QueueRequestMsg) tea.Cmd {
 		return m.rearmPreload()
 	case "queue.remove":
 		if request.Index == m.playlist.Index() {
-			m.player.Stop()
-			m.clearPlaybackTrack()
+			m.stopPlayback()
 		}
 		if !m.playlist.Remove(request.Index) {
 			request.Reply <- ipc.Response{OK: false, Error: "queue index out of range"}
@@ -144,9 +144,9 @@ func (m *Model) handleIPCQueue(request ipc.QueueRequestMsg) tea.Cmd {
 		request.Reply <- m.ipcQueueResponse()
 		return m.rearmPreload()
 	case "queue.clear":
-		m.player.Stop()
+		m.stopPlayback()
+		m.retireTracksPaging()
 		m.replacePlaylist(nil)
-		m.clearPlaybackTrack()
 		m.loadedPlaylist = ""
 		request.Reply <- m.ipcQueueResponse()
 	case "track.play", "track.queue":
@@ -602,6 +602,10 @@ func (m *Model) handleIPCProviderLoad(result ipcProviderLoadResult) tea.Cmd {
 		result.request.Reply <- ipc.Response{OK: false, Error: result.err.Error()}
 		return nil
 	}
+	// This replaces the queue wholesale, so retire any in-flight paged load:
+	// its later pages would otherwise still pass the generation guard and
+	// append onto the list loaded here.
+	m.retireTracksPaging()
 	m.replacePlaylist(result.tracks)
 	m.loadedPlaylist = result.loaded
 	m.setHeaderStateFromTracks(result.tracks)

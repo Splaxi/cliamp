@@ -112,6 +112,7 @@ type lyricsState struct {
 	err     error
 	query   string // "artist\ntitle" of the last fetch
 	scroll  int
+	offset  time.Duration // synced-lyrics timestamp adjustment (persisted as lyrics_offset_ms)
 }
 
 // keymapOverlay holds state for the keybindings overlay.
@@ -132,6 +133,25 @@ type queueOverlay struct {
 	visible bool
 	cursor  int
 	scroll  int
+}
+
+// subsOverlay holds state for the subscribed-shows overlay. Subscriptions come
+// from the provider's local store, so the list itself needs no network call;
+// only the episode fetches triggered from it do.
+type subsOverlay struct {
+	visible bool
+	cursor  int
+	scroll  int
+	shows   []provider.SubscriptionInfo
+	// loader fetches episodes for shows in the list. It is the provider the
+	// list came from, not the active one, which may be a different service.
+	loader    provider.AlbumTrackLoader
+	filtering bool
+	filter    string
+	filtered  []int // indices into shows; nil when filter is empty
+	loading   bool
+	status    string
+	err       string
 }
 
 // plManagerState holds state for the playlist manager overlay.
