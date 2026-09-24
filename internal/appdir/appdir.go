@@ -11,11 +11,14 @@ import (
 // Resolution order:
 //   - CLIAMP_CONFIG_DIR (explicit override)
 //   - XDG_CONFIG_HOME/cliamp
-//   - on Windows: APPDATA/cliamp (preferred over HOME, which Git Bash/MSYS
-//     set to %USERPROFILE% and would otherwise split the config dir between
-//     the daemon and plugin children that receive a synthesized HOME),
-//     with a fallback to the legacy HOME/.config/cliamp location when the
-//     APPDATA location has no config yet but the legacy one does
+//   - on Windows: APPDATA/cliamp, unless HOME points somewhere other than
+//     the profile directory (an explicitly customized HOME keeps working as
+//     before). A default HOME that merely mirrors the profile dir (Git
+//     Bash/MSYS, or the HOME synthesized for plugin children) must not split
+//     the config dir between the daemon and its children.
+//     When the APPDATA location has no config yet but the legacy
+//     HOME/.config/cliamp location does, the legacy one is used so existing
+//     config survives the upgrade.
 //   - HOME/.config/cliamp
 //   - fallback: os.UserHomeDir()/.config/cliamp
 func Dir() (string, error) {
@@ -27,15 +30,11 @@ func Dir() (string, error) {
 	}
 	if runtime.GOOS == "windows" {
 		if appData, ok := os.LookupEnv("APPDATA"); ok && appData != "" {
-			appDir := filepath.Join(appData, "cliamp")
-			if _, err := os.Stat(filepath.Join(appDir, "config.toml")); os.IsNotExist(err) {
-				if legacy := legacyWindowsDir(); legacy != "" && legacy != appDir {
-					if _, lerr := os.Stat(filepath.Join(legacy, "config.toml")); lerr == nil {
-						return legacy, nil
-					}
-				}
+			home, homeSet := os.LookupEnv("HOME")
+			userHome, _ := os.UserHomeDir()
+			if dir, ok := resolveWindowsDir(appData, home, homeSet, userHome); ok {
+				return dir, nil
 			}
-			return appDir, nil
 		}
 	}
 	if home, ok := os.LookupEnv("HOME"); ok && home != "" {
@@ -48,18 +47,32 @@ func Dir() (string, error) {
 	return filepath.Join(home, ".config", "cliamp"), nil
 }
 
-// legacyWindowsDir returns the pre-fix Windows config location
-// (HOME/.config/cliamp, or os.UserHomeDir()/.config/cliamp when HOME is
-// unset) so Dir can fall back to it on upgrade. Returns "" when neither
-// HOME nor a home directory is available.
-func legacyWindowsDir() string {
-	if home, ok := os.LookupEnv("HOME"); ok && home != "" {
-		return filepath.Join(home, ".config", "cliamp")
+// resolveWindowsDir picks the Windows config dir for the given environment.
+// A HOME that merely mirrors the profile directory (or no HOME at all)
+// resolves to APPDATA/cliamp; an explicitly customized HOME falls through
+// (ok=false) so the caller honors it as before. When the APPDATA location
+// has no config.toml but the legacy HOME/.config/cliamp location does, the
+// legacy dir is returned so upgrades keep existing config accessible.
+func resolveWindowsDir(appData, home string, homeSet bool, userHome string) (string, bool) {
+	customHome := homeSet && home != "" && (userHome == "" || home != userHome)
+	if customHome {
+		return "", false
 	}
-	if home, err := os.UserHomeDir(); err == nil && home != "" {
-		return filepath.Join(home, ".config", "cliamp")
+	legacy := ""
+	if homeSet && home != "" {
+		legacy = filepath.Join(home, ".config", "cliamp")
+	} else if userHome != "" {
+		legacy = filepath.Join(userHome, ".config", "cliamp")
 	}
-	return ""
+	appDir := filepath.Join(appData, "cliamp")
+	if _, err := os.Stat(filepath.Join(appDir, "config.toml")); os.IsNotExist(err) {
+		if legacy != "" && legacy != appDir {
+			if _, lerr := os.Stat(filepath.Join(legacy, "config.toml")); lerr == nil {
+				return legacy, true
+			}
+		}
+	}
+	return appDir, true
 }
 
 // PluginDir returns the cliamp plugin directory.
