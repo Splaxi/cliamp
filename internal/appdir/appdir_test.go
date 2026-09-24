@@ -8,6 +8,7 @@ import (
 	"testing"
 )
 
+// TestDir verifies config dir resolution across environment combinations.
 func TestDir(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -152,6 +153,44 @@ func TestResolveWindowsDir(t *testing.T) {
 			t.Fatalf("got %q, want %q", got, want)
 		}
 	})
+
+	t.Run("equivalent home spelling resolves to appdata", func(t *testing.T) {
+		if runtime.GOOS != "windows" {
+			t.Skip("Windows path semantics")
+		}
+		appData := t.TempDir()
+		got, ok := resolveWindowsDir(appData, `c:/users/ann`, true, `C:\Users\Ann`)
+		if !ok {
+			t.Fatal("expected ok=true for an equivalent HOME spelling")
+		}
+		if want := filepath.Join(appData, "cliamp"); got != want {
+			t.Fatalf("got %q, want %q", got, want)
+		}
+	})
+}
+
+// TestSameHomeDirEquivalentSpellings checks that Windows home paths differing
+// only in case or separators count as the same directory, so a daemon with no
+// HOME and a child with an equivalent HOME spelling agree on the config dir.
+func TestSameHomeDirEquivalentSpellings(t *testing.T) {
+	if runtime.GOOS != "windows" {
+		t.Skip("Windows path semantics")
+	}
+	pairs := [][2]string{
+		{`C:\Users\Ann`, `c:/users/ann`},
+		{`C:\Users\Ann\`, `C:/Users/Ann`},
+	}
+	for _, p := range pairs {
+		if !sameHomeDir(p[0], p[1]) {
+			t.Errorf("sameHomeDir(%q, %q) = false, want true", p[0], p[1])
+		}
+	}
+	if sameHomeDir(`C:\Users\Ann`, `C:\Users\Bob`) {
+		t.Error("sameHomeDir of different dirs = true, want false")
+	}
+	if sameHomeDir("", `C:\Users\Ann`) {
+		t.Error("sameHomeDir with empty home = true, want false")
+	}
 }
 
 // TestDirWindowsDefaultHomeUsesAppdata checks Dir end to end for the case
