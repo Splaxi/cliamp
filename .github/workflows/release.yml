@@ -19,9 +19,10 @@ jobs:
           - goos: linux
             goarch: arm64
             runner: ubuntu-latest
-          - goos: darwin
-            goarch: amd64
-            runner: macos-latest
+          # FORK-ONLY: darwin/amd64 dropped — the Rosetta x86_64 Homebrew
+          # install in "Install deps (macOS amd64 cross)" fails on current
+          # macos-latest runners (same failure on upstream). Re-add once
+          # upstream fixes it. This change must NOT go into any upstream PR.
           - goos: darwin
             goarch: arm64
             runner: macos-latest
