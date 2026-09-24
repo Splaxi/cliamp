@@ -5,15 +5,21 @@ package luaplugin
 import "os"
 
 // minimalExecEnv returns the restricted environment for plugin subprocesses:
-// PATH, a HOME/USERPROFILE derived from homeEnv, plus the Windows variables
-// subprocesses commonly need and any explicit cliamp config overrides so a
-// `cliamp remote call` child resolves the same config dir as the daemon.
+// PATH, a HOME derived from homeEnv, the daemon's own USERPROFILE (so a
+// customized HOME cannot make the child resolve a different config dir and
+// miss the daemon socket), plus the Windows variables subprocesses commonly
+// need and any explicit cliamp config overrides so a `cliamp remote call`
+// child resolves the same config dir as the daemon.
 func minimalExecEnv() []string {
 	home := homeEnv()
+	userProfile := os.Getenv("USERPROFILE")
+	if userProfile == "" {
+		userProfile = home
+	}
 	env := []string{
 		"PATH=" + os.Getenv("PATH"),
 		"HOME=" + home,
-		"USERPROFILE=" + home,
+		"USERPROFILE=" + userProfile,
 	}
 	// Pass through the Windows variables subprocesses commonly need; skip
 	// any that are unset. CLIAMP_CONFIG_DIR/XDG_* must propagate so a

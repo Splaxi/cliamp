@@ -191,6 +191,16 @@ func TestSameHomeDirEquivalentSpellings(t *testing.T) {
 	if sameHomeDir("", `C:\Users\Ann`) {
 		t.Error("sameHomeDir with empty home = true, want false")
 	}
+	// Same existing directory through different spellings: exercises the
+	// filesystem-identity comparison, not just the lexical fallback.
+	dir := t.TempDir()
+	alias := strings.ToUpper(filepath.ToSlash(dir))
+	if alias == dir {
+		alias = strings.ToLower(dir)
+	}
+	if !sameHomeDir(dir, alias) {
+		t.Errorf("sameHomeDir(%q, %q) = false, want true", dir, alias)
+	}
 }
 
 // TestDirWindowsDefaultHomeUsesAppdata checks Dir end to end for the case

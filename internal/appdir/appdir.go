@@ -77,17 +77,23 @@ func resolveWindowsDir(appData, home string, homeSet bool, userHome string) (str
 }
 
 // sameHomeDir reports whether home denotes the same directory as userHome.
-// On Windows the comparison ignores case, separator style and trailing
-// separators, so spellings like `C:\Users\Ann` and `c:/users/ann/` match: a
-// daemon with no HOME and a child with an equivalent HOME spelling must
-// agree on the config dir, or the child misses the daemon socket. Elsewhere
-// the comparison is exact.
+// On Windows it first compares filesystem identity (so 8.3 aliases and
+// junctions for the profile dir match), falling back to a comparison that
+// ignores case, separator style and trailing separators, so spellings like
+// `C:\Users\Ann` and `c:/users/ann/` match: a daemon with no HOME and a
+// child with an equivalent HOME spelling must agree on the config dir, or
+// the child misses the daemon socket. Elsewhere the comparison is exact.
 func sameHomeDir(home, userHome string) bool {
 	if home == "" || userHome == "" {
 		return false
 	}
 	if runtime.GOOS != "windows" {
 		return home == userHome
+	}
+	if homeInfo, homeErr := os.Stat(home); homeErr == nil {
+		if userHomeInfo, userHomeErr := os.Stat(userHome); userHomeErr == nil {
+			return os.SameFile(homeInfo, userHomeInfo)
+		}
 	}
 	normalize := func(p string) string {
 		return strings.TrimSuffix(strings.ToUpper(filepath.ToSlash(filepath.Clean(p))), "/")
